@@ -1,4 +1,3 @@
-// client/main.go
 package main
 
 import (
@@ -11,41 +10,77 @@ import (
 
 const maxMsg = 4096
 
-func query(conn net.Conn, text string) error {
-    payload := []byte(text)
-    msgLen := uint32(len(payload))
-    if msgLen > maxMsg {
-        return fmt.Errorf("message too long")
+func buildReq(cmd []string) []byte {
+    // Calculate total size: nstr(4) + for each string: len(4) + data
+    size := 4
+    for _, s := range cmd {
+        size += 4 + len(s)
     }
 
-    wbuf := make([]byte, 4+len(payload))
-    binary.LittleEndian.PutUint32(wbuf[:4], msgLen)
-    copy(wbuf[4:], payload)
+    // Build: [outer len][nstr][len1][str1][len2][str2]...
+    buf := make([]byte, 4+size)
+    binary.LittleEndian.PutUint32(buf[0:4], uint32(size))
+    binary.LittleEndian.PutUint32(buf[4:8], uint32(len(cmd)))
 
-    _, err := conn.Write(wbuf)
-    if err != nil {
-        return fmt.Errorf("write: %w", err)
+    pos := 8
+    for _, s := range cmd {
+        binary.LittleEndian.PutUint32(buf[pos:pos+4], uint32(len(s)))
+        pos += 4
+        copy(buf[pos:], s)
+        pos += len(s)
     }
 
+    return buf
+}
+
+func readResponse(conn net.Conn) error {
+    // Read outer length
     header := make([]byte, 4)
-    _, err = io.ReadFull(conn, header)
+    _, err := io.ReadFull(conn, header)
     if err != nil {
         return fmt.Errorf("read header: %w", err)
     }
 
-    replyLen := binary.LittleEndian.Uint32(header)
-    if replyLen > maxMsg {
-        return fmt.Errorf("reply too long: %d", replyLen)
+    respLen := binary.LittleEndian.Uint32(header)
+    if respLen > maxMsg {
+        return fmt.Errorf("response too long: %d", respLen)
     }
 
-    reply := make([]byte, replyLen)
-    _, err = io.ReadFull(conn, reply)
+    // Read response body: [status(4)][data...]
+    body := make([]byte, respLen)
+    _, err = io.ReadFull(conn, body)
     if err != nil {
-        return fmt.Errorf("read reply: %w", err)
+        return fmt.Errorf("read body: %w", err)
     }
 
-    fmt.Printf("server says: %s\n", reply)
+    status := binary.LittleEndian.Uint32(body[0:4])
+    data := body[4:]
+
+    switch status {
+    case 0: // OK
+        if len(data) > 0 {
+            fmt.Printf("[ok] %s\n", data)
+        } else {
+            fmt.Println("[ok]")
+        }
+    case 1: // NX
+        fmt.Println("[not found]")
+    default:
+        if len(data) > 0 {
+            fmt.Printf("[err] %s\n", data)
+        } else {
+            fmt.Println("[err]")
+        }
+    }
     return nil
+}
+
+func query(conn net.Conn, cmd ...string) error {
+    _, err := conn.Write(buildReq(cmd))
+    if err != nil {
+        return err
+    }
+    return readResponse(conn)
 }
 
 func main() {
@@ -55,17 +90,12 @@ func main() {
     }
     defer conn.Close()
 
-    // Send multiple requests on the same connection
-    if err := query(conn, "hello1"); err != nil {
-        log.Println(err)
-        return
-    }
-    if err := query(conn, "hello2"); err != nil {
-        log.Println(err)
-        return
-    }
-    if err := query(conn, "hello3"); err != nil {
-        log.Println(err)
-        return
-    }
+    // Test: set, get, del, get
+    query(conn, "set", "name", "bimukti")
+    query(conn, "get", "name")
+    query(conn, "set", "lang", "go")
+    query(conn, "get", "lang")
+    query(conn, "del", "name")
+    query(conn, "get", "name")
+    query(conn, "blah")
 }

@@ -13,7 +13,6 @@
 
 package main
 
-
 // ==== Hash Function ====
 // We need a fast hash function. In the tutorial they advise:
 // "Do not use cryptographic hash functions for hashtables because they are slow and overkill."
@@ -164,6 +163,158 @@ func (ht *hTab) delete(key string, hcode uint64) *hnode {
 	return nil
 
 }
+
+
+// now we need to implement REHASHING
+
+// Hamp is the resizable hashTable
+// during rehashing, both new and old are active
+type HMap struct {
+	new *hTab
+	old *hTab
+	migratepos int // next old position to migrate from; to new
+	seed uint64 // seed for our hashing function
+}
+
+const (
+    maxLoadFactor = 8 // allow up to 8 keys per slot on average
+    rehashingWork = 128 // keys to migrate per operation
+)
+
+// now we have to progressive rehashing
+func (m *HMap) helpRehash() {
+
+	// if older is empty, return, rehashing is done or not needed
+	if m.old == nil {
+		return
+	}
+
+	work := 0 // how much work we have done so far
+
+	for work < rehashingWork && m.old.used > 0 {
+		for m.migratepos <= int(m.old.mask) && m.old.tab[m.migratepos] == nil {
+			m.migratepos++
+		}
+		if m.migratepos > int(m.old.mask) {
+			break
+		}
+
+		// now we move the first node from this slot to the newer table
+		slot := &m.old.tab[m.migratepos]
+		node := *slot
+		*slot = node.next // move to the next node
+		node.next = nil //cut off what we have moved so far
+		m.new.insert(node)
+		m.old.used--
+		work++
+	}
+
+	if m.old.used == 0 {
+		// we have fully migrated, drop it
+		m.old = nil
+	}
+
+}
+
+// now we need a function to trigger rehashing
+func (m *HMap) triggerRehashing() {
+	m.old = m.new // may seem odd, why are we assigning the old to the new one?? I have written down the explanation on my obsidian note.
+	m.new = newHTab(int(m.old.mask+1) * 2) // double the size and allocated new Memory. not related to whatever newer had before. old takes care of it now
+	m.migratepos = 0
+}
+
+func (m *HMap) Search(key string) (*hnode, bool) {
+	// first check in the new table
+	// if new table is nil, OLD MUST BE Nil. check prev function, during rehashing we assign old to new (pointer assignment, so O(1) not linear)
+	// thus, if new is nil, we can return early
+
+	if m.new == nil {
+		return nil, false
+	}
+
+	// now we first call the helper rehash function
+	// why? cz we check the new table first, if the rehash already brings the node to the new table, we have one less operation to complete
+
+	m.helpRehash() // we rehash first
+
+	// now we need to have our hash code, we extract it from our key string
+	hcode := murmur3([]byte(key), m.seed)	
+
+	node := m.new.search(key, hcode) // as i have described before, e first checl the new table
+
+	if node == nil && m.old != nil {
+		node = m.old.search(key, hcode)
+	}
+
+	if node == nil {
+		return nil, false
+	}
+
+	return node, true
+
+}
+
+// now insert 
+
+func (m *HMap) Insert (key string, val string) {
+	if m.new == nil {
+		// our new table is nil, we need to start it
+		// that means our old table is also nil
+		// thus, we need to initiate our new table to insert
+		m.new = newHTab(4)
+	}
+
+	// now check if the key already exists, if does update the value only (google upsert. its a thing, i also did for a prev project)
+	hcode := murmur3([]byte(key), m.seed)
+	node, ok := m.Search(key)
+
+	if ok {
+		node.val = val
+		return
+	}
+
+	// if we are here, that means we have not found the key in our table(s)
+	// insert
+	insertNode := &hnode{key: key, val: val, hcode: hcode, next : nil}
+	m.new.insert(insertNode)
+
+	// ok we have already inserted
+	// but do we need to trigger rehashing?? 
+
+	if m.old == nil {
+		// m.old == nil means rehashing is not triggered so we check if we need to or not
+		threshold := int(m.new.mask+1) * maxLoadFactor
+
+		if m.new.used >= threshold {
+			m.triggerRehashing()
+		}
+	}
+
+	m.helpRehash()
+}
+
+func (m *HMap) Delete (key string) bool { // we are not returning the deleted element: why? cz Redis does not, and go's default map's delete doesnt even return a bool
+	if m.new == nil {
+		// we have no element 
+		return false
+	}
+	m.helpRehash()
+
+	hcode := murmur3([]byte(key), m.seed)
+	node := m.new.delete(key, hcode)
+
+	if node == nil && m.old != nil {
+		// also check the old table is it exists and we have not found anything from the new table
+		node = m.old.delete(key, hcode)
+	}
+
+	return node != nil
+}
+
+
+
+
+
 
 
 

@@ -110,6 +110,64 @@ func (ht *hTab) insert(node *hnode) {
 	ht.used++
 }
 
+// function search
+//params: key, and our hashCode
+func (ht *hTab) search(key string, hcode uint64) *hnode {
+	if ht.tab == nil {
+		return nil
+	}
+
+	// if our table is not empty
+	// we need the position
+	pos := hcode & ht.mask
+	cur := ht.tab[pos] // we start at position head for our key
+
+	for cur != nil {
+		if cur.hcode == hcode && cur.key == key {
+			return cur
+		}
+		cur = cur.next
+	}
+
+	return nil 
+
+}
+
+// function delete
+func (ht *hTab) delete(key string, hcode uint64) *hnode {
+	if ht.tab == nil {
+		return nil
+	}
+
+	pos := hcode & ht.mask
+	
+	// rest is basic leetcode
+	var prev *hnode // nil pointer
+	cur := ht.tab[pos]
+
+	for cur != nil {
+		if cur.hcode == hcode && cur.key == key {
+			if prev == nil {
+				// the head node is the one we want to delete
+				ht.tab[pos] = cur.next
+			} else {
+				prev.next = cur.next // skipping current altogether	
+			}
+			cur.next = nil
+			ht.used--
+			return cur
+		} 
+		prev = cur
+		cur = cur.next
+	}
+
+	return nil
+
+}
+
+
+
+
 
 
 

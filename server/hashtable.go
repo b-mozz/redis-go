@@ -12,6 +12,7 @@
 // this is subject to change after I run some benchmark alongside the C redis
 
 package main
+import "sync"
 
 // ==== Hash Function ====
 // We need a fast hash function. In the tutorial they advise:
@@ -310,6 +311,83 @@ func (m *HMap) Delete (key string) bool { // we are not returning the deleted el
 
 	return node != nil
 }
+
+// now we are done with progressive rehashing
+// next: concurrent safety
+
+// go uses goroutine, we need thread safety
+
+// ========= thread safety ===========
+// HMap is not safe for concurrent use: two goroutines hitting Insert/Delete/Search
+// at the same time can race on the buckets. This is especially dangerous during
+// progressive rehashing, where even a "read" can advance the migration and
+// mutate internal state (so a plain RWMutex wouldn't be enough).
+//
+// ConcurrentHMap wraps HMap with a mutex so callers can share one instance
+// across goroutines safely. Every method that touches m must Lock() first and
+// Unlock() when done — the idiomatic pattern is:
+//
+//	func (c *ConcurrentHMap) Insert(k, v string) {
+//	    c.mu.Lock()
+//	    defer c.mu.Unlock()
+//	    c.m.Insert(k, v)
+//	}
+//
+// Always pass *ConcurrentHMap around — never copy by value, because sync.Mutex
+// must not be copied after first use (go vet will flag this).
+type ConcurrentHMap struct {
+	// mu serializes access to m: at most one goroutine can hold it, and any
+	// other goroutine calling Lock() blocks until Unlock() is called. It's
+	// held for the duration of any Insert / Delete / Search so only one
+	// operation touches the table at a time.
+	//
+	// Declared as a value (not *sync.Mutex) because sync.Mutex's zero value is
+	// a valid, unlocked mutex — no constructor or explicit init needed;
+	// `var c ConcurrentHMap` is ready to use. It lives on the struct (rather
+	// than as a package-level lock) so the lock's scope matches the data it
+	// protects, and two independent ConcurrentHMaps don't needlessly block
+	// each other.
+	mu sync.Mutex // guards m. must be held for any read or write of m
+	m  HMap
+}
+
+
+// wrapper for Search function
+func (c *ConcurrentHMap) Get (key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	node, ok := c.m.Search(key)
+	if !ok {
+		return "", false
+	}
+
+	return node.val, true
+}
+
+// wrapper for insert function
+func (c *ConcurrentHMap) Set (key string, val string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.m.Insert(key, val)
+
+}
+
+// wrapper for delete function
+func (c *ConcurrentHMap) Del (key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ok := c.m.Delete(key)
+
+	return ok
+}
+
+
+
+
+
+
 
 
 

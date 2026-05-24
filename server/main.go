@@ -89,7 +89,7 @@ func parseReq(data []byte) ([]string, error){
 //===================================o===================o=======
 
 //----KV Store-----
-var store = map[string]string{}
+var store = &ConcurrentHMap{}
 
 type response struct{
 	status uint32
@@ -98,7 +98,7 @@ type response struct{
 
 func doRequest(cmd []string) response{
 	if cmd[0] == "get" && len(cmd) == 2{
-		val, ok := store[cmd[1]]
+		val, ok := store.Get(cmd[1])
 
 		if !ok{
 			// key does not exist
@@ -107,10 +107,13 @@ func doRequest(cmd []string) response{
 		return response{status : resOk, data: []byte(val)}
 
 	} else if cmd[0] == "set" && len(cmd) == 3{
-		store[cmd[1]] = cmd[2]
+		store.Set(cmd[1], cmd[2])
 		return response{status: resOk}
 	} else if cmd[0] == "del" && len(cmd) == 2{
-		delete(store, cmd[1])
+		ok := store.Del(cmd[1])
+		if !ok {
+			return response{status: resNot} // key didn't exist
+		}
 		return response{status: resOk}
 	}
 

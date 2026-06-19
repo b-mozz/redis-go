@@ -383,6 +383,48 @@ func (c *ConcurrentHMap) Del (key string) bool {
 	return ok
 }
 
+// Size returns the total number of entries across both the new and old tables
+// (during progressive rehashing, entries live in both).
+func (c *ConcurrentHMap) Size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	if c.m.new != nil {
+		n += c.m.new.used
+	}
+	if c.m.old != nil {
+		n += c.m.old.used
+	}
+	return n
+}
+
+// ForEach walks every (key, value) pair in the map. The callback returns
+// false to stop iteration early. The mutex is held for the entire walk,
+// so the callback must not call back into the map (it would deadlock).
+func (c *ConcurrentHMap) ForEach(fn func(key, val string) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m.new != nil && !walk(c.m.new, fn) {
+		return
+	}
+	if c.m.old != nil {
+		walk(c.m.old, fn)
+	}
+}
+
+func walk(ht *hTab, fn func(key, val string) bool) bool {
+	for _, head := range ht.tab {
+		for cur := head; cur != nil; cur = cur.next {
+			if !fn(cur.key, cur.val) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+
+
 
 
 

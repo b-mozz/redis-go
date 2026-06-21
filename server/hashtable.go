@@ -423,6 +423,28 @@ func walk(ht *hTab, fn func(key, val string) bool) bool {
 	return true
 }
 
+// Keys returns a snapshot of every key in the map.
+func (c *ConcurrentHMap) Keys() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0)
+	if c.m.new != nil {
+		collectKeys(c.m.new, &out)
+	}
+	if c.m.old != nil {
+		collectKeys(c.m.old, &out)
+	}
+	return out
+}
+
+func collectKeys(ht *hTab, out *[]string) {
+	for _, head := range ht.tab {
+		for cur := head; cur != nil; cur = cur.next {
+			*out = append(*out, cur.key)
+		}
+	}
+}
+
 
 
 

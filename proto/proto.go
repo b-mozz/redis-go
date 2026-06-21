@@ -1,3 +1,6 @@
+// proto supports TadInt, TagDbl, TagArr
+// thus, the proto is type rich, but the storage only supports strings for now
+
 package proto
 
 import (
@@ -15,7 +18,7 @@ const (
 	ErrTooBig  int32 = 3 // response exceeded MaxMsg
 )
 
-const MaxMsg = 32 << 20 // 32 MiB safety cap on a single response body
+const MaxMsg = 32 << 20 // 32 * 2^20 = 32 MiB safety cap on a single response body
 
 const (
     TagNil byte = 0 // nil / null result
@@ -31,22 +34,16 @@ func appendU8(buf *[]byte, v byte) { // tag or type
 	*buf = append(*buf, v)
 }
 
-func appendU32(buf *[]byte, v uint32) { // length 
-    var tmp [4]byte
-    binary.LittleEndian.PutUint32(tmp[:], v)
-    *buf = append(*buf, tmp[:]...)
+func appendU32(buf *[]byte, v uint32) { // length
+    *buf = binary.LittleEndian.AppendUint32(*buf, v)
 }
 
 func appendI64(buf *[]byte, v int64) { // integers
-    var tmp [8]byte
-    binary.LittleEndian.PutUint64(tmp[:], uint64(v))
-    *buf = append(*buf, tmp[:]...)
+    *buf = binary.LittleEndian.AppendUint64(*buf, uint64(v))
 }
 
 func appendF64(buf *[]byte, v float64) { // floats
-    var tmp [8]byte
-    binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(v))
-    *buf = append(*buf, tmp[:]...)
+    *buf = binary.LittleEndian.AppendUint64(*buf, math.Float64bits(v))
 }
 
 
@@ -81,8 +78,8 @@ func OutErr(out *[]byte, code int32, msg string) {
 // OutArr writes only the array *header*. The caller is responsible
 // for then writing exactly `n` child values.
 func OutArr(out *[]byte, n uint32) {
-    appendU8(out, TagArr)
-    appendU32(out, n)
+    appendU8(out, TagArr)   // 1 byte: "an array is coming"
+    appendU32(out, n)       // 4 bytes: "with n number of elements"
 }
 
 // --- message framing ---

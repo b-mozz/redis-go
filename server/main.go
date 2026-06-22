@@ -116,6 +116,7 @@ case "get":
 
 	if !ok {
 		proto.OutNil(out)
+		return
 	}
 
 	proto.OutStr(out, val)
@@ -124,15 +125,17 @@ case "get":
 
 case "set":
 	if len(cmd) != 3 {
-		proto.OutErr(out, proto.ErrArg, "get only accepts exactly 2 argument")
-
-		store.Set(cmd[1], cmd[2]) // key and value
-		proto.OutNil(out)
+		proto.OutErr(out, proto.ErrArg, "set only accepts exactly 2 arguments")
+		return
 	}
+
+	store.Set(cmd[1], cmd[2]) // key and value
+	proto.OutNil(out)
 
 case "del":
 	if len(cmd) != 2 {
-		proto.OutErr(out, proto.ErrArg, "get only accepts exactly 1 argument")	
+		proto.OutErr(out, proto.ErrArg, "del only accepts exactly 1 argument")
+		return
 	}
 
 	if store.Del(cmd[1]) {
@@ -171,10 +174,14 @@ if err != nil {
 msgLen := binary.LittleEndian.Uint32(header)
 
 if msgLen > maxMsg {
-	return fmt.Errorf("too amny arguments")
+	return fmt.Errorf("message too large: %d", msgLen)
 }
 
 body := make([]byte, msgLen)
+_, err = io.ReadFull(conn, body)
+if err != nil {
+	return fmt.Errorf("body error: %w", err)
+}
 
 cmd, err := parseReq(body)
 

@@ -6,9 +6,11 @@ import (
     "io"
     "log"
     "net"
+
+    "redis_go/proto"
 )
 
-const maxMsg = 4096
+const maxMsg = 32 << 20 // matching server maxMsg
 
 func buildReq(cmd []string) []byte {
     // Calculate total size: nstr(4) + for each string: len(4) + data
@@ -34,7 +36,9 @@ func buildReq(cmd []string) []byte {
 }
 
 func readResponse(conn net.Conn) error {
+
     // Read outer length
+    // every message starts with a 4 byte header(how long the message is), thus we have max len 4 for header
     header := make([]byte, 4)
     _, err := io.ReadFull(conn, header)
     if err != nil {
@@ -46,32 +50,25 @@ func readResponse(conn net.Conn) error {
         return fmt.Errorf("response too long: %d", respLen)
     }
 
-    // Read response body: [status(4)][data...]
+    // proto already has a function named readValue, server uses it
+    // instead of rewriting this function, we will use the same one to keep consistency
+    
+    // first we read the response byte to our body
     body := make([]byte, respLen)
     _, err = io.ReadFull(conn, body)
     if err != nil {
         return fmt.Errorf("read body: %w", err)
     }
 
-    status := binary.LittleEndian.Uint32(body[0:4])
-    data := body[4:]
-
-    switch status {
-    case 0: // OK
-        if len(data) > 0 {
-            fmt.Printf("[ok] %s\n", data)
-        } else {
-            fmt.Println("[ok]")
-        }
-    case 1: // NX
-        fmt.Println("[not found]")
-    default:
-        if len(data) > 0 {
-            fmt.Printf("[err] %s\n", data)
-        } else {
-            fmt.Println("[err]")
-        }
+    // proto already has ReadValue, server uses it too — reuse for consistency.
+    // ReadValue returns the leftover tail because it's used recursively (e.g. for arrays).
+    // Here the body is exactly one value, so we discard the tail.
+    val, _, err := proto.ReadValue(body)
+    if err != nil {
+        return fmt.Errorf("decode: %w", err)
     }
+
+    fmt.Println(proto.PrintValue(val))
     return nil
 }
 
@@ -90,12 +87,14 @@ func main() {
     }
     defer conn.Close()
 
-    // Test: set, get, del, get
-    query(conn, "set", "name", "bimukti")
-    query(conn, "get", "name")
-    query(conn, "set", "lang", "go")
-    query(conn, "get", "lang")
-    query(conn, "del", "name")
-    query(conn, "get", "name")
-    query(conn, "blah")
+    query(conn, "set", "name", "bimukti") // -> (nil)
+    query(conn, "get", "name")             // -> "bimukti"
+    query(conn, "set", "lang", "go")       // -> (nil)
+    query(conn, "get", "lang")             // -> "go"
+    query(conn, "keys")                    // -> array ["name","lang"]
+    query(conn, "del", "name")             // -> (int) 1
+    query(conn, "get", "name")             // -> (nil)
+    query(conn, "del", "nope")             // -> (int) 0
+    query(conn, "get")                     // -> (error) wrong arg count
+    query(conn, "blah")                    // -> (error) unknown command
 }

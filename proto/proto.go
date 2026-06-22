@@ -183,6 +183,7 @@ func ReadValue(buf []byte) (Value, []byte, error) {
 
 // --- pretty printer ---
 // Renders a decoded Value as a human-readable string for debugging / CLI output.
+// this function is for clientSide
 func PrintValue(v Value) string {
 	switch v.Tag {
 	case TagNil:

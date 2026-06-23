@@ -6,6 +6,7 @@ import (
     "io"
     "log"
     "net"
+    "os"
 
     "redis_go/proto"
 )
@@ -81,20 +82,24 @@ func query(conn net.Conn, cmd ...string) error {
 }
 
 func main() {
+    // os.Args[0] is the binary name, so we need at least one more arg for the command
+    // usage: ./client <command> [args...]
+    // e.g.:  ./client set name bimukti
+    //        ./client get name
+    //        ./client keys
+    if len(os.Args) < 2 {
+        log.Fatal("usage: client <command> [args...]")
+    }
+
     conn, err := net.Dial("tcp", "127.0.0.1:1234")
     if err != nil {
         log.Fatal("connect:", err)
     }
     defer conn.Close()
 
-    query(conn, "set", "name", "bimukti") // -> (nil)
-    query(conn, "get", "name")             // -> "bimukti"
-    query(conn, "set", "lang", "go")       // -> (nil)
-    query(conn, "get", "lang")             // -> "go"
-    query(conn, "keys")                    // -> array ["name","lang"]
-    query(conn, "del", "name")             // -> (int) 1
-    query(conn, "get", "name")             // -> (nil)
-    query(conn, "del", "nope")             // -> (int) 0
-    query(conn, "get")                     // -> (error) wrong arg count
-    query(conn, "blah")                    // -> (error) unknown command
+    // os.Args[1:] strips the binary name, leaving just the command + its arguments
+    err = query(conn, os.Args[1:]...)
+    if err != nil {
+        log.Fatal(err)
+    }
 }

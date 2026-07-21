@@ -6,8 +6,18 @@ import (
 "io"
 "log"
 "net"
+"strconv"
+"strings"
+"time"
 
 "redis_go/proto"
+)
+
+const (
+// how often the background expirer wakes up, and how many buckets it scans each time.
+// small budget per tick keeps each pass cheap; over many ticks it covers the whole table.
+sweepInterval = 100 * time.Millisecond
+sweepBudget   = 20
 )
 
 const (
@@ -124,13 +134,77 @@ case "get":
 
 
 case "set":
-	if len(cmd) != 3 {
-		proto.OutErr(out, proto.ErrArg, "set only accepts exactly 2 arguments")
+	// two accepted forms:
+	//   set key val            -> store with no expiry
+	//   set key val EX seconds -> store, then expire after `seconds`
+	if len(cmd) != 3 && len(cmd) != 5 {
+		proto.OutErr(out, proto.ErrArg, "set accepts: set key val [EX seconds]")
 		return
 	}
 
-	store.Set(cmd[1], cmd[2]) // key and value
+	// plain set, no TTL
+	if len(cmd) == 3 {
+		store.Set(cmd[1], cmd[2])
+		proto.OutNil(out)
+		return
+	}
+
+	// len == 5: the 4th token must be EX (case-insensitive), the 5th the seconds
+	if !strings.EqualFold(cmd[3], "EX") {
+		proto.OutErr(out, proto.ErrArg, "set: expected EX before the seconds value")
+		return
+	}
+
+	seconds, err := strconv.ParseInt(cmd[4], 10, 64)
+	if err != nil || seconds <= 0 {
+		proto.OutErr(out, proto.ErrArg, "set: EX seconds must be a positive integer")
+		return
+	}
+
+	store.SetTTL(cmd[1], cmd[2], seconds)
 	proto.OutNil(out)
+	return
+
+case "expire":
+	// expire key seconds -> attach a TTL to an existing key
+	if len(cmd) != 3 {
+		proto.OutErr(out, proto.ErrArg, "expire accepts exactly 2 arguments: expire key seconds")
+		return
+	}
+
+	seconds, err := strconv.ParseInt(cmd[2], 10, 64)
+	if err != nil || seconds <= 0 {
+		proto.OutErr(out, proto.ErrArg, "expire: seconds must be a positive integer")
+		return
+	}
+
+	if store.Expire(cmd[1], seconds) {
+		proto.OutInt(out, 1) // key existed, TTL set
+	} else {
+		proto.OutInt(out, 0) // no such key
+	}
+
+case "ttl":
+	// ttl key -> remaining seconds, or -1 (no expiry) / -2 (missing)
+	if len(cmd) != 2 {
+		proto.OutErr(out, proto.ErrArg, "ttl only accepts exactly 1 argument")
+		return
+	}
+
+	proto.OutInt(out, store.TTL(cmd[1]))
+
+case "persist":
+	// persist key -> strip the TTL so the key stops expiring
+	if len(cmd) != 2 {
+		proto.OutErr(out, proto.ErrArg, "persist only accepts exactly 1 argument")
+		return
+	}
+
+	if store.Persist(cmd[1]) {
+		proto.OutInt(out, 1) // a TTL was removed
+	} else {
+		proto.OutInt(out, 0) // no such key, or it had no TTL
+	}
 
 case "del":
 	if len(cmd) != 2 {
@@ -216,6 +290,22 @@ func handleConn(conn net.Conn) {
 }
 
 
+// startExpiryLoop runs the active expirer in the background. every sweepInterval it
+// asks the store to evict a bounded number of expired keys. this is a supplement to
+// lazy expiration (in Search): lazy handles keys that get accessed, this handles keys
+// that are set-and-forgotten so they don't sit in memory forever.
+func startExpiryLoop() {
+	ticker := time.NewTicker(sweepInterval)
+
+	// run the loop on a goroutine so it ticks in the background instead of blocking
+	// startup. for range over ticker.C fires the body once per tick, forever.
+	go func() {
+		for range ticker.C {
+			store.SweepExpired(time.Now().UnixNano(), sweepBudget)
+		}
+	}()
+}
+
 func main() {
 	listener, err := net.Listen("tcp", ":1234")
 	if err != nil {
@@ -223,6 +313,8 @@ func main() {
 	}
 	defer listener.Close()
 	fmt.Println("listening on :1234")
+
+	startExpiryLoop() // begin background eviction of expired keys
 
 	for {
 		conn, err := listener.Accept()

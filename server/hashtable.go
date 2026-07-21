@@ -12,7 +12,11 @@
 // this is subject to change after I run some benchmark alongside the C redis
 
 package main
-import "sync"
+
+import (
+	"sync"
+	"time"
+)
 
 // ==== Hash Function ====
 // We need a fast hash function. In the tutorial they advise:
@@ -76,6 +80,17 @@ type hnode struct {
 	val   string
 	hcode uint64 // for caching. we store the uint64 val from the hashFunction. if that matches, then we check is the string key matches
 	next  *hnode
+
+	// expireAt is an absolute deadline in Unix nanoseconds (time.Now().UnixNano()).
+	// 0 means "never expires" — a real timestamp is always > 0, so 0 is a safe sentinel.
+	// Absolute (not seconds-remaining) so it stays correct across restarts (AOF replay).
+	expireAt int64
+}
+
+// expired reports if the key is past its deadline. now is passed in (not read here)
+// so tests can fake the clock and the sweeper can read the clock once per tick.
+func (n *hnode) expired(now int64) bool {
+	return n.expireAt != 0 && now >= n.expireAt
 }
 
 // htab is a FIXED size hashTable (basically array of linked list HEADS)
@@ -165,6 +180,38 @@ func (ht *hTab) delete(key string, hcode uint64) *hnode {
 
 }
 
+// sweepBucket walks the chain at bucket `pos` and unlinks every expired node.
+// It returns how many nodes it evicted. `now` is the current time in Unix nanos.
+// This is the same relink-while-walking pattern as delete(), just applied to
+// every expired node in the chain instead of one matching key.
+func (ht *hTab) sweepBucket(pos int, now int64) int {
+	evicted := 0
+	var prev *hnode
+	cur := ht.tab[pos]
+
+	for cur != nil {
+		if cur.expired(now) {
+			next := cur.next
+
+			if prev == nil {
+				ht.tab[pos] = next // head was expired, move head forward
+			} else {
+				prev.next = next // skip over the expired node
+			}
+
+			cur.next = nil // cut the evicted node loose
+			ht.used--
+			evicted++
+			cur = next // prev stays put: we removed cur, so its predecessor is unchanged
+		} else {
+			prev = cur
+			cur = cur.next
+		}
+	}
+
+	return evicted
+}
+
 
 // now we need to implement REHASHING
 
@@ -175,6 +222,10 @@ type HMap struct {
 	old *hTab
 	migratepos int // next old position to migrate from; to new
 	seed uint64 // seed for our hashing function
+
+	// sweepCursor is the next bucket the active expirer (SweepExpired) will look at.
+	// it lets the sweep resume where it left off instead of scanning from 0 each time.
+	sweepCursor int
 }
 
 const (
@@ -242,12 +293,26 @@ func (m *HMap) Search(key string) (*hnode, bool) {
 	hcode := murmur3([]byte(key), m.seed)	
 
 	node := m.new.search(key, hcode) // as i have described before, e first checl the new table
+	foundInOld := false
 
 	if node == nil && m.old != nil {
 		node = m.old.search(key, hcode)
+		foundInOld = true // remember where we found it, so lazy eviction deletes from the right table
 	}
 
 	if node == nil {
+		return nil, false
+	}
+
+	// lazy expiration: if the key is past its deadline, evict it right now and report
+	// a miss. this way an expired key is never handed back, even before the background
+	// sweeper (A3) gets a chance to clean it up.
+	if node.expired(time.Now().UnixNano()) {
+		if foundInOld {
+			m.old.delete(key, hcode)
+		} else {
+			m.new.delete(key, hcode)
+		}
 		return nil, false
 	}
 
@@ -312,6 +377,19 @@ func (m *HMap) Delete (key string) bool { // we are not returning the deleted el
 	return node != nil
 }
 
+// setExpiry sets the absolute deadline (Unix nanos) on an existing key.
+// pass expireAt = 0 to clear the TTL (make the key immortal again).
+// returns false if the key doesn't exist. NOT thread-safe on its own — callers
+// go through the ConcurrentHMap wrappers which hold the lock.
+func (m *HMap) setExpiry(key string, expireAt int64) bool {
+	node, ok := m.Search(key)
+	if !ok {
+		return false
+	}
+	node.expireAt = expireAt
+	return true
+}
+
 // now we are done with progressive rehashing
 // next: concurrent safety
 
@@ -364,13 +442,72 @@ func (c *ConcurrentHMap) Get (key string) (string, bool) {
 	return node.val, true
 }
 
-// wrapper for insert function
+// wrapper for insert function.
+// a plain Set clears any existing TTL on the key — matches Redis, where SET without
+// an expiry option makes the key persistent again.
 func (c *ConcurrentHMap) Set (key string, val string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.m.Insert(key, val)
+	c.m.setExpiry(key, 0) // drop any TTL the old value may have had
+}
 
+// SetTTL stores key/val with an expiry of ttlSeconds from now.
+// backs the `set key val EX seconds` command.
+func (c *ConcurrentHMap) SetTTL (key string, val string, ttlSeconds int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.m.Insert(key, val)
+	expireAt := time.Now().UnixNano() + ttlSeconds*int64(time.Second)
+	c.m.setExpiry(key, expireAt)
+}
+
+// Expire sets a TTL of ttlSeconds on an existing key.
+// returns true if the key exists (TTL applied), false otherwise. backs `expire`.
+func (c *ConcurrentHMap) Expire (key string, ttlSeconds int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	expireAt := time.Now().UnixNano() + ttlSeconds*int64(time.Second)
+	return c.m.setExpiry(key, expireAt)
+}
+
+// TTL reports the remaining life of a key in whole seconds. backs `ttl`.
+// sentinels match Redis:  -1 = key exists but has no expiry,  -2 = key does not exist.
+func (c *ConcurrentHMap) TTL (key string) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	node, ok := c.m.Search(key) // Search also lazily evicts the key if it's already expired
+	if !ok {
+		return -2 // no such key
+	}
+	if node.expireAt == 0 {
+		return -1 // key exists but never expires
+	}
+
+	// Search guarantees the node isn't past its deadline, so remaining > 0.
+	remaining := node.expireAt - time.Now().UnixNano()
+
+	// round UP to whole seconds so a key with 0.3s left reports 1, not 0
+	return (remaining + int64(time.Second) - 1) / int64(time.Second)
+}
+
+// Persist removes the TTL from a key, making it immortal again.
+// returns true only if a TTL was actually removed. backs `persist`.
+func (c *ConcurrentHMap) Persist (key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	node, ok := c.m.Search(key)
+	if !ok || node.expireAt == 0 {
+		return false // no such key, or it had no TTL to begin with
+	}
+
+	node.expireAt = 0
+	return true
 }
 
 // wrapper for delete function
@@ -396,6 +533,39 @@ func (c *ConcurrentHMap) Size() int {
 		n += c.m.old.used
 	}
 	return n
+}
+
+// SweepExpired actively evicts expired keys, doing a BOUNDED amount of work per call:
+// it looks at at most `budget` buckets, starting from where the last call stopped
+// (m.sweepCursor). This spreads expiry cleanup across many small calls instead of one
+// O(N) stall — the same "a little at a time" idea as progressive rehashing. `now` is
+// the current time in Unix nanos. It returns the number of keys evicted.
+//
+// It only sweeps the `new` table. Anything still sitting in `old` during a rehash is
+// either migrated into `new` by helpRehash (where a later sweep will catch it) or
+// evicted lazily on access, so nothing leaks permanently.
+func (c *ConcurrentHMap) SweepExpired(now int64, budget int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ht := c.m.new
+	if ht == nil {
+		return 0 // map was never used, nothing to sweep
+	}
+
+	buckets := int(ht.mask) + 1
+	evicted := 0
+
+	for i := 0; i < budget; i++ {
+		if c.m.sweepCursor >= buckets {
+			c.m.sweepCursor = 0 // reached the end of the table, wrap back to the start
+		}
+
+		evicted += ht.sweepBucket(c.m.sweepCursor, now)
+		c.m.sweepCursor++
+	}
+
+	return evicted
 }
 
 // ForEach walks every (key, value) pair in the map. The callback returns

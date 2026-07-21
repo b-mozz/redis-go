@@ -63,10 +63,25 @@ go run ./client del name
 
 | Command | Description | Response |
 |---|---|---|
-| `set <key> <value>` | store a key/value pair | nil |
+| `set <key> <value> [EX <seconds>]` | store a key/value pair, optionally with a TTL | nil |
 | `get <key>` | look up a key | string, or nil if missing |
 | `del <key>` | delete a key | int: 1 if deleted, 0 if not found |
 | `keys` | list all keys | array of strings |
+| `expire <key> <seconds>` | attach a TTL to an existing key | int: 1 if key exists, 0 if not |
+| `ttl <key>` | remaining life of a key | int: seconds left, `-1` if no TTL, `-2` if missing |
+| `persist <key>` | remove a key's TTL | int: 1 if a TTL was removed, 0 otherwise |
+
+## Expiration
+
+Keys can carry a TTL, stored on each node as an absolute deadline. Expiry happens
+two ways, mirroring Redis:
+
+- **Lazy**: `get` (and any lookup) checks the deadline and evicts an expired key on
+  access, so an expired value is never returned.
+- **Active**: a background goroutine periodically sweeps a *bounded* number of buckets
+  per tick and evicts expired keys, so set-and-forgotten keys don't linger in memory.
+  This reuses the same "a little work at a time" idea as progressive rehashing rather
+  than doing one O(N) scan.
 
 ## Benchmarks
 
@@ -124,7 +139,6 @@ Features:
 
 - interactive REPL client (read commands from stdin instead of one-shot CLI args)
 - `exists`, `incr` / `decr` commands
-- TTL support: `expire`, `ttl`, and lazy expiration in get/set
 - sorted set commands (`zadd`, `zrange`, `zscore`) — needs a new data structure
 
 Testing:

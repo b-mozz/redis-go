@@ -132,10 +132,8 @@ func (ht *hTab) search(key string, hcode uint64) *hnode {
 		return nil
 	}
 
-	// if our table is not empty
-	// we need the position
 	pos := hcode & ht.mask
-	cur := ht.tab[pos] // we start at position head for our key
+	cur := ht.tab[pos]
 
 	for cur != nil {
 		if cur.hcode == hcode && cur.key == key {
@@ -289,10 +287,9 @@ func (m *HMap) Search(key string) (*hnode, bool) {
 
 	m.helpRehash() // we rehash first
 
-	// now we need to have our hash code, we extract it from our key string
-	hcode := murmur3([]byte(key), m.seed)	
+	hcode := murmur3([]byte(key), m.seed)
 
-	node := m.new.search(key, hcode) // as i have described before, e first checl the new table
+	node := m.new.search(key, hcode) // check the new table first
 	foundInOld := false
 
 	if node == nil && m.old != nil {
@@ -324,13 +321,11 @@ func (m *HMap) Search(key string) (*hnode, bool) {
 
 func (m *HMap) Insert (key string, val string) {
 	if m.new == nil {
-		// our new table is nil, we need to start it
-		// that means our old table is also nil
-		// thus, we need to initiate our new table to insert
+		// first insert: start the new table (old is nil too at this point)
 		m.new = newHTab(4)
 	}
 
-	// now check if the key already exists, if does update the value only (google upsert. its a thing, i also did for a prev project)
+	// if the key already exists, update the value only (google upsert. its a thing, i also did for a prev project)
 	hcode := murmur3([]byte(key), m.seed)
 	node, ok := m.Search(key)
 
@@ -339,13 +334,10 @@ func (m *HMap) Insert (key string, val string) {
 		return
 	}
 
-	// if we are here, that means we have not found the key in our table(s)
-	// insert
 	insertNode := &hnode{key: key, val: val, hcode: hcode, next : nil}
 	m.new.insert(insertNode)
 
-	// ok we have already inserted
-	// but do we need to trigger rehashing?? 
+	// but do we need to trigger rehashing??
 
 	if m.old == nil {
 		// m.old == nil means rehashing is not triggered so we check if we need to or not

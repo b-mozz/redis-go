@@ -1,5 +1,7 @@
 # redis_go
 
+[![CI](https://github.com/b-mozz/redis-go/actions/workflows/ci.yml/badge.svg)](https://github.com/b-mozz/redis-go/actions/workflows/ci.yml)
+
 This is a learning project, not a production database. A small Redis-inspired in-memory key-value store written in Go, including a custom
 hash table, a typed binary wire protocol, and a concurrent TCP server. 
 
@@ -125,6 +127,28 @@ A few things stand out:
   lock-free reads, is much faster here. This is a limitation of the current design
   and is the first item on the roadmap below.
 
+## Tests
+
+Run them with:
+
+```
+go test ./...          # all tests
+go test -race ./...    # with the race detector
+```
+
+Current coverage:
+
+- **TTL / expiration** (`server/ttl_test.go`): lazy eviction on access, the active
+  sweeper (evicts expired keys, leaves live ones), the sweeper's per-call budget, and
+  the `ttl` / `persist` sentinel values.
+- **Concurrency** (`server/concurrent_test.go`): a stress test that runs many
+  goroutines doing mixed set/get/del/set-with-TTL against one `ConcurrentHMap`. It's
+  meant to be run under `-race` as proof the locking is correct.
+- **Wire protocol** (`proto/proto_test.go`): round-trip tests asserting every `Out*`
+  writer decodes back to the same value via `ReadValue`.
+
+CI (GitHub Actions) runs `go vet`, `go build`, and `go test -race` on every push.
+
 ## Planned improvements
 
 Performance:
@@ -143,8 +167,8 @@ Features:
 
 Testing:
 
-- round-trip tests for `parseReq` and `ReadValue` / `Out*` symmetry
-- concurrent stress tests for `ConcurrentHMap` under simultaneous set/del
+- round-trip tests for `parseReq` (request decoding)
+- an end-to-end server test driving real commands over a TCP connection
 
 ## Notes
 

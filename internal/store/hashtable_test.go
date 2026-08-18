@@ -13,10 +13,10 @@
 // concurrent string->string map. Whatever speed difference we see is the cost (or
 // benefit) of OUR progressive-rehashing design, not the network.
 //
-// to run:  go test -bench=. ./server/
+// to run:  go test -bench=. ./internal/store/
 // the report gives ns/op (nanoseconds per operation). lower is better.
 
-package main
+package store
 
 import (
 	"strconv"

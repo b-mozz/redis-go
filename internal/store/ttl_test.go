@@ -4,7 +4,7 @@
 //   - active sweeper: a background pass drops expired keys you never touch
 //   - the ttl / persist sentinel values (-1 no expiry, -2 missing)
 
-package main
+package store
 
 import (
 	"strconv"

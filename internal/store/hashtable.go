@@ -11,7 +11,7 @@
 // Note: #PERFORMANCE tag is used to note down critical design decisions
 // this is subject to change after I run some benchmark alongside the C redis
 
-package main
+package store
 
 import (
 	"sync"
@@ -215,7 +215,7 @@ func (ht *hTab) sweepBucket(pos int, now int64) int {
 
 // Hamp is the resizable hashTable
 // during rehashing, both new and old are active
-type HMap struct {
+type hMap struct {
 	new *hTab
 	old *hTab
 	migratepos int // next old position to migrate from; to new
@@ -232,7 +232,7 @@ const (
 )
 
 // now we have to progressive rehashing
-func (m *HMap) helpRehash() {
+func (m *hMap) helpRehash() {
 
 	// if older is empty, return, rehashing is done or not needed
 	if m.old == nil {
@@ -267,13 +267,13 @@ func (m *HMap) helpRehash() {
 }
 
 // now we need a function to trigger rehashing
-func (m *HMap) triggerRehashing() {
+func (m *hMap) triggerRehashing() {
 	m.old = m.new // may seem odd, why are we assigning the old to the new one?? I have written down the explanation on my obsidian note.
 	m.new = newHTab(int(m.old.mask+1) * 2) // double the size and allocated new Memory. not related to whatever newer had before. old takes care of it now
 	m.migratepos = 0
 }
 
-func (m *HMap) Search(key string) (*hnode, bool) {
+func (m *hMap) Search(key string) (*hnode, bool) {
 	// first check in the new table
 	// if new table is nil, OLD MUST BE Nil. check prev function, during rehashing we assign old to new (pointer assignment, so O(1) not linear)
 	// thus, if new is nil, we can return early
@@ -319,7 +319,7 @@ func (m *HMap) Search(key string) (*hnode, bool) {
 
 // now insert 
 
-func (m *HMap) Insert (key string, val string) {
+func (m *hMap) Insert (key string, val string) {
 	if m.new == nil {
 		// first insert: start the new table (old is nil too at this point)
 		m.new = newHTab(4)
@@ -351,7 +351,7 @@ func (m *HMap) Insert (key string, val string) {
 	m.helpRehash()
 }
 
-func (m *HMap) Delete (key string) bool { // we are not returning the deleted element: why? cz Redis does not, and go's default map's delete doesnt even return a bool
+func (m *hMap) Delete (key string) bool { // we are not returning the deleted element: why? cz Redis does not, and go's default map's delete doesnt even return a bool
 	if m.new == nil {
 		// we have no element 
 		return false
@@ -373,7 +373,7 @@ func (m *HMap) Delete (key string) bool { // we are not returning the deleted el
 // pass expireAt = 0 to clear the TTL (make the key immortal again).
 // returns false if the key doesn't exist. NOT thread-safe on its own — callers
 // go through the ConcurrentHMap wrappers which hold the lock.
-func (m *HMap) setExpiry(key string, expireAt int64) bool {
+func (m *hMap) setExpiry(key string, expireAt int64) bool {
 	node, ok := m.Search(key)
 	if !ok {
 		return false
@@ -388,12 +388,12 @@ func (m *HMap) setExpiry(key string, expireAt int64) bool {
 // go uses goroutine, we need thread safety
 
 // ========= thread safety ===========
-// HMap is not safe for concurrent use: two goroutines hitting Insert/Delete/Search
+// hMap is not safe for concurrent use: two goroutines hitting Insert/Delete/Search
 // at the same time can race on the buckets. This is especially dangerous during
 // progressive rehashing, where even a "read" can advance the migration and
 // mutate internal state (so a plain RWMutex wouldn't be enough).
 //
-// ConcurrentHMap wraps HMap with a mutex so callers can share one instance
+// ConcurrentHMap wraps hMap with a mutex so callers can share one instance
 // across goroutines safely. Every method that touches m must Lock() first and
 // Unlock() when done — the idiomatic pattern is:
 //
@@ -418,7 +418,7 @@ type ConcurrentHMap struct {
 	// protects, and two independent ConcurrentHMaps don't needlessly block
 	// each other.
 	mu sync.Mutex // guards m. must be held for any read or write of m
-	m  HMap
+	m  hMap
 }
 
 

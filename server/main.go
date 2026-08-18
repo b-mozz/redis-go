@@ -10,6 +10,7 @@ import (
 "strings"
 "time"
 
+"redis_go/internal/store"
 "redis_go/proto"
 )
 
@@ -101,8 +102,9 @@ return cmd, nil
 }
 
 
-// key value store
-var store = & ConcurrentHMap{}
+// key value store.
+// named db, not store, because `store` is now the package name (redis_go/internal/store).
+var db = &store.ConcurrentHMap{}
 
 // doRequest writes a typed response into out using the proto package.
 // One Out* call per response — caller wraps with ResponseBegin/End.
@@ -122,7 +124,7 @@ case "get":
 		return
 	}
 
-	val, ok := store.Get(cmd[1]) // cmd 1 is the key
+	val, ok := db.Get(cmd[1]) // cmd 1 is the key
 
 	if !ok {
 		proto.OutNil(out)
@@ -144,7 +146,7 @@ case "set":
 
 	// plain set, no TTL
 	if len(cmd) == 3 {
-		store.Set(cmd[1], cmd[2])
+		db.Set(cmd[1], cmd[2])
 		proto.OutNil(out)
 		return
 	}
@@ -161,7 +163,7 @@ case "set":
 		return
 	}
 
-	store.SetTTL(cmd[1], cmd[2], seconds)
+	db.SetTTL(cmd[1], cmd[2], seconds)
 	proto.OutNil(out)
 	return
 
@@ -178,7 +180,7 @@ case "expire":
 		return
 	}
 
-	if store.Expire(cmd[1], seconds) {
+	if db.Expire(cmd[1], seconds) {
 		proto.OutInt(out, 1) // key existed, TTL set
 	} else {
 		proto.OutInt(out, 0) // no such key
@@ -191,7 +193,7 @@ case "ttl":
 		return
 	}
 
-	proto.OutInt(out, store.TTL(cmd[1]))
+	proto.OutInt(out, db.TTL(cmd[1]))
 
 case "persist":
 	// persist key -> strip the TTL so the key stops expiring
@@ -200,7 +202,7 @@ case "persist":
 		return
 	}
 
-	if store.Persist(cmd[1]) {
+	if db.Persist(cmd[1]) {
 		proto.OutInt(out, 1) // a TTL was removed
 	} else {
 		proto.OutInt(out, 0) // no such key, or it had no TTL
@@ -212,7 +214,7 @@ case "del":
 		return
 	}
 
-	if store.Del(cmd[1]) {
+	if db.Del(cmd[1]) {
 		proto.OutInt(out, 1)
 	} else {
 		proto.OutInt(out, 0)
@@ -220,7 +222,7 @@ case "del":
 	
 
 case "keys":
-	keys := store.Keys() // keys return a slice
+	keys := db.Keys() // keys return a slice
 	proto.OutArr(out, uint32(len(keys))) // first we update the header. "1 array coming of n length"
 
 	for _, k := range keys {
@@ -301,7 +303,7 @@ func startExpiryLoop() {
 	// startup. for range over ticker.C fires the body once per tick, forever.
 	go func() {
 		for range ticker.C {
-			store.SweepExpired(time.Now().UnixNano(), sweepBudget)
+			db.SweepExpired(time.Now().UnixNano(), sweepBudget)
 		}
 	}()
 }

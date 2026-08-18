@@ -4,14 +4,14 @@
 // The point of this test is NOT to check a specific return value -- it's to run
 // it with the race detector:
 //
-//	go test -race ./server/
+//	go test -race ./internal/store/
 //
 // The -race flag reports if two goroutines ever touch the same memory without a
 // lock. If our mutex is correct, this passes clean; if it isn't, -race prints the
 // exact conflicting reads/writes. For a project whose whole selling point is a
 // concurrent map, a clean -race run is real proof the locking works.
 
-package main
+package store
 
 import (
 	"strconv"

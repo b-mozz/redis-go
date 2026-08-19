@@ -1,296 +1,277 @@
 package main
 
 import (
-"encoding/binary"
-"fmt"
-"io"
-"log"
-"net"
-"strconv"
-"strings"
-"time"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"strconv"
+	"strings"
+	"time"
 
-"redis_go/internal/store"
-"redis_go/proto"
+	"redis_go/internal/store"
+	"redis_go/resp"
 )
 
 const (
-// how often the background expirer wakes up, and how many buckets it scans each time.
-// small budget per tick keeps each pass cheap; over many ticks it covers the whole table.
-sweepInterval = 100 * time.Millisecond
-sweepBudget   = 20
+	// how often the background expirer wakes up, and how many buckets it scans each time.
+	// small budget per tick keeps each pass cheap; over many ticks it covers the whole table.
+	sweepInterval = 100 * time.Millisecond
+	sweepBudget   = 20
 )
-
-const (
-maxMsg = 32 << 20 // description in proto.go
-maxArgs = 200
-)
-
-
-//  server/main.go doesn't need pointers because nothing there is append-ing. 
-// The moment we wire in proto.Out* calls (in doRequest), we do use *[]byte — because that's where growth happens. The rule is
-// consistent: pointer when growing, value when reading or in-place writing.
-
-
-// request parser, calling it reader
-type reader struct {
-data []byte 
-pos int // what position we are at rn
-}
-
-func (r *reader) readU32() (uint32, error) {
-if r.pos + 4 > len(r.data) {
-	return 0, fmt.Errorf("unexpected end of data")
-}
-
-val := binary.LittleEndian.Uint32(r.data[r.pos : r.pos + 4])
-r.pos += 4
-return val, nil
-}
-
-// to read strings, param: n --> length of the string
-func (r *reader) readStr(n int) (string, error) {
-if r.pos + n > len(r.data) {
-	return "", fmt.Errorf("unexpected end of data")
-}
-
-val := string(r.data[r.pos : r.pos + n])
-r.pos += n
-return val, nil
-}
-
-// parseReq parses the request
-// one request (param data) contains one command at a time
-// nstr -> number of strings in the request
-//   ┌─────┬─────┬──────┬─────┬──────┬─────┬─────────┐
-//   │  3  │  3  │ "get"│  4  │ "name│  0  │   ""    │
-//   │nstr │ len │ str  │ len │ "    │ len │ (empty) │
-//   └─────┴─────┴──────┴─────┴──────┴─────┴─────────┘
-//     4B    4B    3B    4B    4B     4B     0B
-func parseReq (data []byte) ([]string, error){
-r := &reader{data : data}
-
-nstr, err := r.readU32() // nstr: number of arguments 
-
-if err != nil {
-	return nil, err
-}
-
-if nstr > maxArgs {
-	return nil, fmt.Errorf("too many args: %d", nstr)
-}
-
-cmd := make([]string, 0, nstr) // make([]string, nstr) also works
-
-for i := uint32(0); i < nstr; i++ {
-	n, err := r.readU32()
-
-	if err != nil {
-		return nil, err
-	}
-
-	s, err := r.readStr(int(n))
-
-	if err != nil {
-		return nil, err
-	}
-
-	cmd = append(cmd, s)
-}
-
-return cmd, nil
-}
-
 
 // key value store.
 // named db, not store, because `store` is now the package name (redis_go/internal/store).
 var db = &store.ConcurrentHMap{}
 
-// doRequest writes a typed response into out using the proto package.
-// One Out* call per response — caller wraps with ResponseBegin/End.
-// we check command then append on out slice based on our need
-func doRequest(cmd []string, out *[]byte) {
-if len(cmd) == 0 {
-	proto.OutErr(out, proto.ErrUnknown, "empty command")
-	return
+func doRequest(argv []string, w *resp.Writer) {
+	if len(argv) == 0 {
+		return
+	}
+
+	name := strings.ToUpper(argv[0])
+
+	switch name {
+	case "GET":
+		if len(argv) != 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		val, ok := db.Get(argv[1])
+		if !ok {
+			w.Nil()
+			return
+		}
+
+		w.Bulk(val)
+
+	case "SET":
+		// two accepted forms:
+		//   SET key val            -> store with no expiry
+		//   SET key val EX seconds -> store, then expire after `seconds`
+		if len(argv) != 3 && len(argv) != 5 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		if len(argv) == 3 {
+			db.Set(argv[1], argv[2])
+			w.OK()
+			return
+		}
+
+		if !strings.EqualFold(argv[3], "EX") {
+			w.Err("ERR syntax error")
+			return
+		}
+
+		seconds, err := strconv.ParseInt(argv[4], 10, 64)
+		if err != nil {
+			w.Err(errNotInteger)
+			return
+		}
+		if seconds <= 0 {
+			w.Err("ERR invalid expire time in 'set' command")
+			return
+		}
+
+		db.SetTTL(argv[1], argv[2], seconds)
+		w.OK()
+
+	case "EXPIRE":
+		if len(argv) != 3 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		seconds, err := strconv.ParseInt(argv[2], 10, 64)
+		if err != nil {
+			w.Err(errNotInteger)
+			return
+		}
+		if seconds <= 0 {
+			w.Err("ERR invalid expire time in 'expire' command")
+			return
+		}
+
+		if db.Expire(argv[1], seconds) {
+			w.Int(1)
+		} else {
+			w.Int(0)
+		}
+
+	case "TTL":
+		if len(argv) != 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		w.Int(db.TTL(argv[1]))
+
+	case "PERSIST":
+		if len(argv) != 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		if db.Persist(argv[1]) {
+			w.Int(1)
+		} else {
+			w.Int(0)
+		}
+
+	case "DEL":
+		// variadic: DEL a b c -> the number actually removed
+		if len(argv) < 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		var n int64
+		for _, key := range argv[1:] {
+			if db.Del(key) {
+				n++
+			}
+		}
+
+		w.Int(n)
+
+	case "EXISTS":
+		if len(argv) < 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		var n int64
+		for _, key := range argv[1:] {
+			if _, ok := db.Get(key); ok {
+				n++
+			}
+		}
+
+		w.Int(n)
+
+	case "KEYS":
+		// only the "*" pattern is supported; glob matching comes later.
+		if len(argv) != 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		keys := db.Keys()
+		w.Arr(len(keys))
+		for _, k := range keys {
+			w.Bulk(k)
+		}
+
+	case "DBSIZE":
+		if len(argv) != 1 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		w.Int(int64(db.Size()))
+
+	case "PING":
+		switch len(argv) {
+		case 1:
+			w.Simple("PONG")
+		case 2:
+			w.Bulk(argv[1])
+		default:
+			w.Err(wrongArgs(name))
+		}
+
+	case "ECHO":
+		if len(argv) != 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+
+		w.Bulk(argv[1])
+
+	case "COMMAND":
+		// redis-cli sends COMMAND DOCS on connect; an empty array satisfies it.
+		w.Arr(0)
+
+	case "SELECT":
+		if len(argv) != 2 {
+			w.Err(wrongArgs(name))
+			return
+		}
+		if argv[1] != "0" {
+			w.Err("ERR DB index is out of range")
+			return
+		}
+
+		w.OK()
+
+	case "CONFIG":
+		// CONFIG GET <param> -> empty array rather than an error, which is what
+		// client libraries expect for an unknown parameter.
+		if len(argv) >= 2 && strings.EqualFold(argv[1], "GET") {
+			w.Arr(0)
+			return
+		}
+
+		w.Err(unknownCommand(argv))
+
+	default:
+		w.Err(unknownCommand(argv))
+	}
 }
 
-// now cmd[0] is always the command (get, set, del, etc)
-// we can use if - else statements to check different commands, but lets use switch here
-switch cmd[0] {
-case "get":
-	if len(cmd) != 2 {
-		proto.OutErr(out, proto.ErrArg, "get only accepts exactly 1 argument")
-		return
-	}
+const errNotInteger = "ERR value is not an integer or out of range"
 
-	val, ok := db.Get(cmd[1]) // cmd 1 is the key
-
-	if !ok {
-		proto.OutNil(out)
-		return
-	}
-
-	proto.OutStr(out, val)
-	return
-
-
-case "set":
-	// two accepted forms:
-	//   set key val            -> store with no expiry
-	//   set key val EX seconds -> store, then expire after `seconds`
-	if len(cmd) != 3 && len(cmd) != 5 {
-		proto.OutErr(out, proto.ErrArg, "set accepts: set key val [EX seconds]")
-		return
-	}
-
-	// plain set, no TTL
-	if len(cmd) == 3 {
-		db.Set(cmd[1], cmd[2])
-		proto.OutNil(out)
-		return
-	}
-
-	// len == 5: the 4th token must be EX (case-insensitive), the 5th the seconds
-	if !strings.EqualFold(cmd[3], "EX") {
-		proto.OutErr(out, proto.ErrArg, "set: expected EX before the seconds value")
-		return
-	}
-
-	seconds, err := strconv.ParseInt(cmd[4], 10, 64)
-	if err != nil || seconds <= 0 {
-		proto.OutErr(out, proto.ErrArg, "set: EX seconds must be a positive integer")
-		return
-	}
-
-	db.SetTTL(cmd[1], cmd[2], seconds)
-	proto.OutNil(out)
-	return
-
-case "expire":
-	// expire key seconds -> attach a TTL to an existing key
-	if len(cmd) != 3 {
-		proto.OutErr(out, proto.ErrArg, "expire accepts exactly 2 arguments: expire key seconds")
-		return
-	}
-
-	seconds, err := strconv.ParseInt(cmd[2], 10, 64)
-	if err != nil || seconds <= 0 {
-		proto.OutErr(out, proto.ErrArg, "expire: seconds must be a positive integer")
-		return
-	}
-
-	if db.Expire(cmd[1], seconds) {
-		proto.OutInt(out, 1) // key existed, TTL set
-	} else {
-		proto.OutInt(out, 0) // no such key
-	}
-
-case "ttl":
-	// ttl key -> remaining seconds, or -1 (no expiry) / -2 (missing)
-	if len(cmd) != 2 {
-		proto.OutErr(out, proto.ErrArg, "ttl only accepts exactly 1 argument")
-		return
-	}
-
-	proto.OutInt(out, db.TTL(cmd[1]))
-
-case "persist":
-	// persist key -> strip the TTL so the key stops expiring
-	if len(cmd) != 2 {
-		proto.OutErr(out, proto.ErrArg, "persist only accepts exactly 1 argument")
-		return
-	}
-
-	if db.Persist(cmd[1]) {
-		proto.OutInt(out, 1) // a TTL was removed
-	} else {
-		proto.OutInt(out, 0) // no such key, or it had no TTL
-	}
-
-case "del":
-	if len(cmd) != 2 {
-		proto.OutErr(out, proto.ErrArg, "del only accepts exactly 1 argument")
-		return
-	}
-
-	if db.Del(cmd[1]) {
-		proto.OutInt(out, 1)
-	} else {
-		proto.OutInt(out, 0)
-	}
-	
-
-case "keys":
-	keys := db.Keys() // keys return a slice
-	proto.OutArr(out, uint32(len(keys))) // first we update the header. "1 array coming of n length"
-
-	for _, k := range keys {
-		proto.OutStr(out, k)
-	}
-default:
-	proto.OutErr(out, proto.ErrUnknown, "unknown command")
+func wrongArgs(name string) string {
+	return fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(name))
 }
 
-}
-
-// networking
-func oneRequest(conn net.Conn) error {
-header := make([]byte, 4)
-
-_, err := io.ReadFull(conn, header)
-
-if err != nil {
-	if err == io.EOF { // end of data stream
-		return io.EOF
+func unknownCommand(argv []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "ERR unknown command '%s', with args beginning with: ", argv[0])
+	for _, a := range argv[1:] {
+		fmt.Fprintf(&b, "'%s', ", a)
 	}
-	return fmt.Errorf("header error: %w", err)
-}
-
-msgLen := binary.LittleEndian.Uint32(header)
-
-if msgLen > maxMsg {
-	return fmt.Errorf("message too large: %d", msgLen)
-}
-
-body := make([]byte, msgLen)
-_, err = io.ReadFull(conn, body)
-if err != nil {
-	return fmt.Errorf("body error: %w", err)
-}
-
-cmd, err := parseReq(body)
-
-if err != nil {
-	return fmt.Errorf("req parsing error: %w", err)
-}
-
-// build response with proto framing
-out := make([]byte, 0, 64)
-hdr := proto.ResponseBegin(&out)
-doRequest(cmd, &out)
-proto.ResponseEnd(&out, hdr)
-
-_, err = conn.Write(out)
-return err
-
+	return b.String()
 }
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	for {
-		err := oneRequest(conn)
+	rd := resp.NewReader(conn)
+	w := resp.NewWriter(conn)
 
+	for {
+		argv, err := rd.ReadCommand()
 		if err != nil {
-			if err != io.EOF {
-				log.Println(err)
+			// A protocol error is terminal: framing is lost, so there is no way
+			// to find the start of the next command. Reply, then hang up.
+			var pe *resp.ProtocolError
+			if errors.As(err, &pe) {
+				w.Err(pe.Error())
+				w.Flush()
 			}
-			return 
+			return
+		}
+
+		if len(argv) == 0 {
+			continue
+		}
+
+		doRequest(argv, w)
+
+		// Nothing left to parse means the next read blocks, so the replies have
+		// to be on the wire before we get there.
+		if rd.Buffered() == 0 {
+			if err := w.Flush(); err != nil {
+				return
+			}
 		}
 	}
 }
-
 
 // startExpiryLoop runs the active expirer in the background. every sweepInterval it
 // asks the store to evict a bounded number of expired keys. this is a supplement to
@@ -309,12 +290,16 @@ func startExpiryLoop() {
 }
 
 func main() {
-	listener, err := net.Listen("tcp", ":1234")
+	port := flag.Int("port", 6379, "port to listen on")
+	flag.Parse()
+
+	addr := fmt.Sprintf(":%d", *port)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal("listen:", err)
 	}
 	defer listener.Close()
-	fmt.Println("listening on :1234")
+	fmt.Println("listening on", addr)
 
 	startExpiryLoop() // begin background eviction of expired keys
 
@@ -327,10 +312,3 @@ func main() {
 		go handleConn(conn)
 	}
 }
-
-
-
-
-
-
-

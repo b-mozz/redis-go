@@ -304,7 +304,13 @@ func (m *hMap) Search(key string) (*hnode, bool) {
 	// lazy expiration: if the key is past its deadline, evict it right now and report
 	// a miss. this way an expired key is never handed back, even before the background
 	// sweeper (A3) gets a chance to clean it up.
-	if node.expired(time.Now().UnixNano()) {
+	//
+	// the expireAt != 0 test is deliberately repeated here, even though expired()
+	// already does it. Go evaluates arguments eagerly, so without this guard the clock
+	// is read BEFORE expired() gets a chance to short-circuit. time.Now() costs ~32ns
+	// on darwin/arm64 — half of a whole lookup — and most keys carry no TTL at all.
+	// see doc/benchmark-before-lock-striping.md
+	if node.expireAt != 0 && node.expired(time.Now().UnixNano()) {
 		if foundInOld {
 			m.old.delete(key, hcode)
 		} else {

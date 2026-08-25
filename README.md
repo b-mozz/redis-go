@@ -1,175 +1,142 @@
-# redis_go
+<h1 align="center">redis_go</h1>
 
-[![CI](https://github.com/b-mozz/redis-go/actions/workflows/ci.yml/badge.svg)](https://github.com/b-mozz/redis-go/actions/workflows/ci.yml)
+<p align="center">
+  A Redis server written from scratch in Go — custom hash table, RESP protocol,<br>
+  TTL expiry, lock-striped concurrent store. Speaks to the real <code>redis-cli</code>.
+</p>
 
-This is a learning project, not a production database. A small Redis-inspired in-memory key-value store written in Go, including a custom
-hash table, a typed binary wire protocol, and a concurrent TCP server. 
+<p align="center">
+  <a href="https://github.com/b-mozz/redis-go/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/b-mozz/redis-go/ci.yml?branch=main&label=CI&style=flat-square&logo=githubactions&logoColor=white"></a>
+  <a href="go.mod"><img alt="Go version" src="https://img.shields.io/github/go-mod/go-version/b-mozz/redis-go?style=flat-square&logo=go&logoColor=white"></a>
+  <a href="https://pkg.go.dev/github.com/b-mozz/redis-go"><img alt="Go reference" src="https://img.shields.io/badge/pkg.go.dev-reference-007d9c?style=flat-square&logo=go&logoColor=white"></a>
+</p>
 
-## Why this project
+<p align="center">
+  <a href="#benchmarks"><img alt="Dependencies" src="https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square"></a>
+  <a href="#benchmarks"><img alt="Allocations" src="https://img.shields.io/badge/allocations-0%20per%20op-brightgreen?style=flat-square"></a>
+  <a href="#tests"><img alt="Tests" src="https://img.shields.io/badge/tests-race%20detector-8A2BE2?style=flat-square"></a>
+  <a href="#benchmarks"><img alt="Protocol" src="https://img.shields.io/badge/protocol-RESP-DC382D?style=flat-square&logo=redis&logoColor=white"></a>
+</p>
 
-I wanted to understand how an in-memory database works under the hood instead of
-just using `redis-cli`. So rather than wrapping Go's built-in `map`, I tried to
-implement the core pieces myself to learn the trade-offs involved:
+<p align="center">
+  <img alt="Top language" src="https://img.shields.io/github/languages/top/b-mozz/redis-go?style=flat-square">
+  <img alt="Code size" src="https://img.shields.io/github/languages/code-size/b-mozz/redis-go?style=flat-square">
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/b-mozz/redis-go?style=flat-square">
+</p>
 
-- how a hash table is built (hashing, collision chaining, load factor, resizing)
-- why Redis uses progressive rehashing instead of resizing all at once
-- how to design a length-prefixed binary protocol and frame messages over TCP
-- how to make a data structure safe for concurrent use with goroutines
-- how to benchmark my own code against the standard library
+## Benchmarks
 
-The aim was depth over breadth: a small feature set, but a genuine attempt to
-understand each piece.
+Apple M2, 8 cores · Go 1.25 · `benchstat` n=10.
 
-## Architecture
+### vs. real redis-server
+
+`redis-benchmark -t set,get -n 200000 -c 50`, against `redis-server 8.10.1` with
+persistence off:
+
+| | SET ops/s | GET ops/s |
+|---|---|---|
+| `redis-server` (C) | 169,635 | 167,504 |
+| **`redis_go`** | **148,039** | **148,368** |
+
+**Within ~13% of C Redis** on the unpipelined path.
+
+### Lock striping
+
+The store is split across 32 stripes, each with its own mutex and its own hash table,
+selected by the high bits of the key's hash. Parallel `Get`, ns/op — lower is better:
+
+| cores | 1 mutex | 32 stripes | speedup |
+|---|---|---|---|
+| 2 | 55.6 | **24.9** | 2.2x |
+| 4 | 109.2 | **17.3** | **6.3x** |
+| 8 | 131.2 | **22.0** | **6.0x** |
+
+The number that matters is aggregate throughput as cores are added:
+
+| cores | 1 mutex | 32 stripes |
+|---|---|---|
+| 2 | 0.69x | **1.71x** |
+| 4 | 0.35x | **2.45x** |
+| 8 | **0.29x** | **1.93x** |
+
+With one lock, adding seven cores made the store **3.4x slower** — every core fighting
+for the same cache line. Striping turns that around: cores now add throughput.
+
+Both read and write paths are **zero-allocation** (`0 B/op`, `0 allocs/op`).
+
+Caveats worth stating: `sync.Map` still beats this on pure reads (it takes no lock at
+all), striping costs ~11% single-threaded, and end-to-end the server is syscall-bound —
+so this win shows up in the store today, not yet at the socket.
+
+```sh
+go test -bench=. -benchmem ./internal/store/
+```
+
+## Why
+
+To understand how an in-memory database actually works instead of just using one —
+hashing and collision handling, why Redis rehashes progressively instead of all at once,
+how RESP frames messages over TCP, and how to make a data structure safe under
+goroutines. Depth over breadth: few features, each one built properly.
+
+Learning project, not a production database.
+
+## Layout
 
 ```
-client/      CLI client: builds a request, sends it, decodes the typed response
-server/      TCP server + the custom hash table (ConcurrentHMap)
-proto/       binary wire protocol: typed writers, framing, and a reader
-doc/         design notes (todo list, Go pointer/value notes)
+server/          TCP server: accept loop, command dispatch, expiry loop
+internal/store/  the hash table and its concurrency
+resp/            RESP protocol reader and writer
 ```
 
-Design notes:
-
-- **Custom hash table** (`server/hashtable.go`) using MurmurHash3 for hashing and
-  separate chaining for collisions.
-- **Progressive rehashing**: when the table grows, keys are migrated from the old
-  table to the new one a few at a time on each operation, instead of in a single
-  O(N) pass. The intent is to avoid a latency spike during a resize.
-- **Concurrency**: `ConcurrentHMap` wraps the table in a mutex so it can be shared
-  across goroutines. The server runs one goroutine per connection.
-- **Typed binary protocol** (`proto/proto.go`): each value carries a type tag (nil,
-  error, string, int, double, array), and each message is prefixed with a u32
-  length so the reader knows how many bytes to expect.
+- **Hash table** — MurmurHash3, separate chaining.
+- **Progressive rehashing** — on resize, keys migrate a few per operation instead of one
+  O(N) pass, so a grow never stalls the server.
+- **Lock striping** — `ShardedMap` fans the keyspace across 32 independent stripes. Each
+  uses a plain `Mutex`, not an `RWMutex`, because progressive rehashing means even a read
+  mutates the table.
+- **Expiry** — lazily on access, plus a background sweeper that does a bounded number of
+  buckets per tick.
 
 ## Running it
 
 Requires Go 1.25+.
 
-Start the server (listens on `:1234`):
-
-```
-go run ./server
+```sh
+go run ./server          # listens on :6379
 ```
 
-In another terminal, run commands with the client:
+Then use the real Redis client:
 
-```
-go run ./client set name bimukti
-go run ./client get name
-go run ./client keys
-go run ./client del name
-```
-
-## Supported commands
-
-| Command | Description | Response |
-|---|---|---|
-| `set <key> <value> [EX <seconds>]` | store a key/value pair, optionally with a TTL | nil |
-| `get <key>` | look up a key | string, or nil if missing |
-| `del <key>` | delete a key | int: 1 if deleted, 0 if not found |
-| `keys` | list all keys | array of strings |
-| `expire <key> <seconds>` | attach a TTL to an existing key | int: 1 if key exists, 0 if not |
-| `ttl <key>` | remaining life of a key | int: seconds left, `-1` if no TTL, `-2` if missing |
-| `persist <key>` | remove a key's TTL | int: 1 if a TTL was removed, 0 otherwise |
-
-## Expiration
-
-Keys can carry a TTL, stored on each node as an absolute deadline. Expiry happens
-two ways, mirroring Redis:
-
-- **Lazy**: `get` (and any lookup) checks the deadline and evicts an expired key on
-  access, so an expired value is never returned.
-- **Active**: a background goroutine periodically sweeps a *bounded* number of buckets
-  per tick and evicts expired keys, so set-and-forgotten keys don't linger in memory.
-  This reuses the same "a little work at a time" idea as progressive rehashing rather
-  than doing one O(N) scan.
-
-## Benchmarks
-
-Run them with:
-
-```
-go test -bench=. -benchmem ./server/
+```sh
+redis-cli set name bimukti
+redis-cli get name
+redis-cli set session abc EX 60
+redis-cli ttl session
 ```
 
-The custom `ConcurrentHMap` is compared against two common alternatives in Go:
-`sync.Map` and a plain `map` guarded by an `RWMutex`. The goal is to measure the
-data structure itself, which is why this does not benchmark against real Redis (an
-end-to-end comparison would mostly measure network and protocol overhead, and Redis
-is a mature C codebase that this isn't trying to compete with).
+## Commands
 
-These numbers are from one machine (Apple M2) and are meant to show rough
-trade-offs, not precise figures.
+`get` · `set [EX seconds]` · `del` · `exists` · `keys` · `dbsize` · `expire` · `ttl` ·
+`persist` · `ping` · `echo`
 
-Single-threaded:
-
-| Operation | ConcurrentHMap | sync.Map | map + RWMutex |
-|---|---|---|---|
-| Set | 42.8 ns/op | 72.8 ns/op | 29.3 ns/op |
-| Get | 36.4 ns/op | 20.1 ns/op | 17.2 ns/op |
-| Del | 98.4 ns/op | 99.3 ns/op | 59.3 ns/op |
-
-Parallel (8 goroutines):
-
-| Operation | ConcurrentHMap | sync.Map | map + RWMutex |
-|---|---|---|---|
-| Get | 126.3 ns/op | 3.8 ns/op | 77.7 ns/op |
-| Mixed (90% read) | 136.1 ns/op | 9.2 ns/op | 54.3 ns/op |
-
-A few things stand out:
-
-- On single-threaded `Set`, `ConcurrentHMap` does reasonably well and avoids
-  per-operation allocations, though a plain `map + RWMutex` is still faster.
-- Under concurrent load, reads do not scale. `Get` takes a full mutex rather than a
-  read lock, because progressive rehashing can mutate internal state during a read,
-  so concurrent readers end up serialized. `sync.Map`, which is optimized for
-  lock-free reads, is much faster here. This is a limitation of the current design
-  and is the first item on the roadmap below.
+`ttl` returns seconds remaining, `-1` if the key has no expiry, `-2` if it does not
+exist. `keys` currently only honours `*`.
 
 ## Tests
 
-Run them with:
-
-```
-go test ./...          # all tests
-go test -race ./...    # with the race detector
+```sh
+go test -race ./...
 ```
 
-Current coverage:
+Covers TTL and expiry semantics, RESP round-trips and fuzzing, and concurrency stress
+tests run under the race detector — plus stripe distribution, concurrent per-stripe
+rehashing, and sweep coverage across stripes. CI runs `go vet`, `go build`, and
+`go test -race` on every push.
 
-- **TTL / expiration** (`server/ttl_test.go`): lazy eviction on access, the active
-  sweeper (evicts expired keys, leaves live ones), the sweeper's per-call budget, and
-  the `ttl` / `persist` sentinel values.
-- **Concurrency** (`server/concurrent_test.go`): a stress test that runs many
-  goroutines doing mixed set/get/del/set-with-TTL against one `ConcurrentHMap`. It's
-  meant to be run under `-race` as proof the locking is correct.
-- **Wire protocol** (`proto/proto_test.go`): round-trip tests asserting every `Out*`
-  writer decodes back to the same value via `ReadValue`.
+## Next
 
-CI (GitHub Actions) runs `go vet`, `go build`, and `go test -race` on every push.
-
-## Planned improvements
-
-Performance:
-
-- **Shard the map (lock striping)** to address the concurrent-read bottleneck: split
-  the keyspace across several independent sub-maps, each with its own lock, so reads
-  on different shards don't block each other.
-- Look into lock-free reads (taking the lock only when actually advancing
-  migration), which could help `Get` scale under concurrency.
-
-Features:
-
-- interactive REPL client (read commands from stdin instead of one-shot CLI args)
-- `exists`, `incr` / `decr` commands
-- sorted set commands (`zadd`, `zrange`, `zscore`) — needs a new data structure
-
-Testing:
-
-- round-trip tests for `parseReq` (request decoding)
-- an end-to-end server test driving real commands over a TCP connection
-
-## Notes
-
-This is a work in progress and not complete. 
+- **The connection path** — the real bottleneck: syscalls per command, buffering, and
+  per-command allocations in the RESP reader.
+- `incr` / `decr`, glob matching for `keys`, sorted sets.
+- Persistence and replication.

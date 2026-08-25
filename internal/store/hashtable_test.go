@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 // benchKeys pre-builds a fixed set of keys so the key-generation cost (strconv,
@@ -408,6 +409,168 @@ func BenchmarkLockedMap_Mixed_Parallel(b *testing.B) {
 			} else {
 				store.Get(key)
 			}
+			i++
+		}
+	})
+}
+
+// ============================================================
+// ShardedMap -- the striped version. see doc/benchmark-before-lock-striping.md
+// ============================================================
+//
+// These are the "after" column. Same workloads as the ConcurrentHMap benchmarks
+// above, so the two are directly comparable at every -cpu setting.
+
+func BenchmarkShardedMap_Set(b *testing.B) {
+	keys := makeBenchKeys(benchSize)
+	store := &ShardedMap{}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.Set(keys[i%benchSize], "value")
+	}
+}
+
+func BenchmarkShardedMap_Get(b *testing.B) {
+	keys := makeBenchKeys(benchSize)
+	store := &ShardedMap{}
+
+	for _, key := range keys {
+		store.Set(key, "value")
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.Get(keys[i%benchSize])
+	}
+}
+
+func BenchmarkShardedMap_Del(b *testing.B) {
+	keys := makeBenchKeys(benchSize)
+	store := &ShardedMap{}
+
+	for _, key := range keys {
+		store.Set(key, "value")
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.Del(keys[i%benchSize])
+	}
+}
+
+func BenchmarkShardedMap_Get_Parallel(b *testing.B) {
+	keys := makeBenchKeys(benchSize)
+	store := &ShardedMap{}
+
+	for _, key := range keys {
+		store.Set(key, "value")
+	}
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := keys[i%benchSize]
+			store.Get(key)
+			i++
+		}
+	})
+}
+
+func BenchmarkShardedMap_Mixed_Parallel(b *testing.B) {
+	keys := makeBenchKeys(benchSize)
+	store := &ShardedMap{}
+
+	for _, key := range keys {
+		store.Set(key, "value")
+	}
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := keys[i%benchSize]
+			if i%10 == 0 {
+				store.Set(key, "value")
+			} else {
+				store.Get(key)
+			}
+			i++
+		}
+	})
+}
+
+// ---- the cache-line padding, measured rather than assumed ----
+//
+// paddedShardedMap is identical to ShardedMap except each stripe is padded out to a
+// full 128-byte cache line (M-series line size), so no two stripes' mutexes share one.
+//
+// The real ShardedMap is deliberately NOT padded: measured over n=10 the padding is
+// worth geomean -1.22% with the sign flipping across core counts, i.e. nothing. See the
+// comment on `stripe` in sharded.go for why (the mutex shares its line with the same
+// stripe's own hMap header, which the lock holder needs anyway, so the false sharing
+// overlaps with sharing that is real).
+//
+// This variant stays so that conclusion is re-checkable instead of folklore. Run:
+//
+//	go test ./internal/store -run '^$' -bench 'Padded?_Get_Parallel' -cpu=1,2,4,8 -count=10
+//
+// Get/Set only -- that is all the benchmark needs.
+
+const benchCacheLine = 128
+
+type paddedStripe struct {
+	mu sync.Mutex
+	m  hMap
+	_  [benchCacheLine - unsafe.Sizeof(struct {
+		mu sync.Mutex
+		m  hMap
+	}{})%benchCacheLine]byte
+}
+
+type paddedShardedMap struct {
+	stripes [numStripes]paddedStripe
+}
+
+func (s *paddedShardedMap) Set(key, val string) {
+	hcode := murmur3([]byte(key), storeSeed)
+	st := &s.stripes[stripeOf(hcode)]
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.m.insert(key, val, hcode)
+	st.m.setExpiryH(key, hcode, 0)
+}
+
+func (s *paddedShardedMap) Get(key string) (string, bool) {
+	hcode := murmur3([]byte(key), storeSeed)
+	st := &s.stripes[stripeOf(hcode)]
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	node, ok := st.m.search(key, hcode)
+	if !ok {
+		return "", false
+	}
+	return node.val, true
+}
+
+func BenchmarkShardedMapPadded_Get_Parallel(b *testing.B) {
+	keys := makeBenchKeys(benchSize)
+	store := &paddedShardedMap{}
+
+	for _, key := range keys {
+		store.Set(key, "value")
+	}
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := keys[i%benchSize]
+			store.Get(key)
 			i++
 		}
 	})

@@ -23,7 +23,7 @@ const (
 
 // key value store.
 // named db, not store, because `store` is now the package name (redis_go/internal/store).
-var db = &store.ConcurrentHMap{}
+var db = &store.ShardedMap{}
 
 func doRequest(argv []string, w *resp.Writer) {
 	if len(argv) == 0 {

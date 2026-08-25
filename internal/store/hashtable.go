@@ -273,21 +273,20 @@ func (m *hMap) triggerRehashing() {
 	m.migratepos = 0
 }
 
-func (m *hMap) Search(key string) (*hnode, bool) {
-	// first check in the new table
-	// if new table is nil, OLD MUST BE Nil. check prev function, during rehashing we assign old to new (pointer assignment, so O(1) not linear)
-	// thus, if new is nil, we can return early
-
+// search is Search with the hash already computed. ShardedMap picks a stripe from
+// hcode before it can call in here, so re-deriving the hash inside would cost a second
+// murmur3 (~11.5ns, BenchmarkMurmur3) on every single operation. The callers that
+// already know hcode pass it down; Search below is the shim for the ones that don't.
+func (m *hMap) search(key string, hcode uint64) (*hnode, bool) {
+	// if new table is nil, OLD MUST BE Nil. check triggerRehashing, during rehashing we
+	// assign old to new (pointer assignment, so O(1) not linear), thus we can return early
 	if m.new == nil {
 		return nil, false
 	}
 
 	// now we first call the helper rehash function
 	// why? cz we check the new table first, if the rehash already brings the node to the new table, we have one less operation to complete
-
 	m.helpRehash() // we rehash first
-
-	hcode := murmur3([]byte(key), m.seed)
 
 	node := m.new.search(key, hcode) // check the new table first
 	foundInOld := false
@@ -320,27 +319,35 @@ func (m *hMap) Search(key string) (*hnode, bool) {
 	}
 
 	return node, true
+}
 
+// Search looks a key up, hashing it first. Kept so callers that don't already have the
+// hash (and the white-box tests) keep working unchanged.
+func (m *hMap) Search(key string) (*hnode, bool) {
+	if m.new == nil {
+		return nil, false // don't pay for murmur3 on an empty map
+	}
+	return m.search(key, murmur3([]byte(key), m.seed))
 }
 
 // now insert 
 
-func (m *hMap) Insert (key string, val string) {
+// insert is Insert with the hash already computed. see search() for why.
+func (m *hMap) insert(key string, val string, hcode uint64) {
 	if m.new == nil {
 		// first insert: start the new table (old is nil too at this point)
 		m.new = newHTab(4)
 	}
 
 	// if the key already exists, update the value only (google upsert. its a thing, i also did for a prev project)
-	hcode := murmur3([]byte(key), m.seed)
-	node, ok := m.Search(key)
+	node, ok := m.search(key, hcode)
 
 	if ok {
 		node.val = val
 		return
 	}
 
-	insertNode := &hnode{key: key, val: val, hcode: hcode, next : nil}
+	insertNode := &hnode{key: key, val: val, hcode: hcode, next: nil}
 	m.new.insert(insertNode)
 
 	// but do we need to trigger rehashing??
@@ -357,14 +364,20 @@ func (m *hMap) Insert (key string, val string) {
 	m.helpRehash()
 }
 
-func (m *hMap) Delete (key string) bool { // we are not returning the deleted element: why? cz Redis does not, and go's default map's delete doesnt even return a bool
+func (m *hMap) Insert(key string, val string) {
+	m.insert(key, val, murmur3([]byte(key), m.seed))
+}
+
+// del is Delete with the hash already computed. see search() for why.
+// we are not returning the deleted element: why? cz Redis does not, and go's default
+// map's delete doesnt even return a bool
+func (m *hMap) del(key string, hcode uint64) bool {
 	if m.new == nil {
-		// we have no element 
+		// we have no element
 		return false
 	}
 	m.helpRehash()
 
-	hcode := murmur3([]byte(key), m.seed)
 	node := m.new.delete(key, hcode)
 
 	if node == nil && m.old != nil {
@@ -375,17 +388,29 @@ func (m *hMap) Delete (key string) bool { // we are not returning the deleted el
 	return node != nil
 }
 
-// setExpiry sets the absolute deadline (Unix nanos) on an existing key.
-// pass expireAt = 0 to clear the TTL (make the key immortal again).
-// returns false if the key doesn't exist. NOT thread-safe on its own — callers
-// go through the ConcurrentHMap wrappers which hold the lock.
-func (m *hMap) setExpiry(key string, expireAt int64) bool {
-	node, ok := m.Search(key)
+func (m *hMap) Delete(key string) bool {
+	if m.new == nil {
+		return false // don't pay for murmur3 on an empty map
+	}
+	return m.del(key, murmur3([]byte(key), m.seed))
+}
+
+// setExpiryH is setExpiry with the hash already computed. see search() for why.
+func (m *hMap) setExpiryH(key string, hcode uint64, expireAt int64) bool {
+	node, ok := m.search(key, hcode)
 	if !ok {
 		return false
 	}
 	node.expireAt = expireAt
 	return true
+}
+
+// setExpiry sets the absolute deadline (Unix nanos) on an existing key.
+// pass expireAt = 0 to clear the TTL (make the key immortal again).
+// returns false if the key doesn't exist. NOT thread-safe on its own — callers
+// go through the ConcurrentHMap / ShardedMap wrappers which hold the lock.
+func (m *hMap) setExpiry(key string, expireAt int64) bool {
+	return m.setExpiryH(key, murmur3([]byte(key), m.seed), expireAt)
 }
 
 // now we are done with progressive rehashing
@@ -447,8 +472,11 @@ func (c *ConcurrentHMap) Set (key string, val string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.m.Insert(key, val)
-	c.m.setExpiry(key, 0) // drop any TTL the old value may have had
+	// hash once, use twice: Insert and setExpiry would otherwise each derive the same
+	// hcode, paying murmur3 twice per SET.
+	hcode := murmur3([]byte(key), c.m.seed)
+	c.m.insert(key, val, hcode)
+	c.m.setExpiryH(key, hcode, 0) // drop any TTL the old value may have had
 }
 
 // SetTTL stores key/val with an expiry of ttlSeconds from now.
@@ -457,9 +485,10 @@ func (c *ConcurrentHMap) SetTTL (key string, val string, ttlSeconds int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.m.Insert(key, val)
+	hcode := murmur3([]byte(key), c.m.seed)
+	c.m.insert(key, val, hcode)
 	expireAt := time.Now().UnixNano() + ttlSeconds*int64(time.Second)
-	c.m.setExpiry(key, expireAt)
+	c.m.setExpiryH(key, hcode, expireAt)
 }
 
 // Expire sets a TTL of ttlSeconds on an existing key.

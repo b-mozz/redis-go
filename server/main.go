@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"redis_go/internal/store"
-	"redis_go/resp"
+	"github.com/b-mozz/redis-go/internal/store"
+	"github.com/b-mozz/redis-go/resp"
 )
 
 const (
@@ -22,7 +22,7 @@ const (
 )
 
 // key value store.
-// named db, not store, because `store` is now the package name (redis_go/internal/store).
+// named db, not store, because `store` is now the package name (github.com/b-mozz/redis-go/internal/store).
 var db = &store.ShardedMap{}
 
 func doRequest(argv []string, w *resp.Writer) {

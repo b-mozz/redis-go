@@ -1,4 +1,4 @@
-// sharded.go
+// striped.go
 // Lock striping for the store. See doc/benchmark-before-lock-striping.md for the
 // measurements that motivated this, and doc/replication-plan.md §1.5 for the design.
 //
@@ -9,7 +9,7 @@
 // single-cacheline ping-pong: every core wanting the lock must pull that line into its
 // own L1 exclusive, invalidating it everywhere else.
 //
-// ShardedMap splits the keyspace across numStripes independent (mutex, hMap) pairs.
+// StripedMap splits the keyspace across numStripes independent (mutex, hMap) pairs.
 // Contention divides by numStripes, and because each stripe owns its own old/new
 // tables and migratepos, a rehash now stalls 1/numStripes of the keyspace instead of
 // all of it.
@@ -37,7 +37,7 @@ const (
 	// storeSeed is the murmur3 seed used for every stripe. It MUST match hMap.seed,
 	// because one hcode both picks the stripe and indexes the buckets inside it. It is
 	// 0 so that a zero-value hMap (hMap.seed == 0) is already consistent with it — no
-	// constructor needed, which is what keeps ShardedMap usable as &ShardedMap{}.
+	// constructor needed, which is what keeps StripedMap usable as &StripedMap{}.
 	storeSeed uint64 = 0
 )
 
@@ -76,7 +76,7 @@ func stripeOf(hcode uint64) uint64 {
 // that is real and unavoidable, so separating the stripes saves a fetch that was
 // already needed.
 //
-// BenchmarkShardedMapPadded_Get_Parallel in hashtable_test.go keeps the padded variant
+// BenchmarkStripedMapPadded_Get_Parallel in hashtable_test.go keeps the padded variant
 // alive so this can be re-checked rather than taken on trust. If numStripes ever drops
 // far enough that a few adjacent stripes get genuinely hot, re-run it before assuming
 // this conclusion still holds.
@@ -88,26 +88,30 @@ type stripe struct {
 	m  hMap
 }
 
-// ShardedMap is the striped store. Zero value is ready to use — &ShardedMap{} — for
+// StripedMap is the striped store. Zero value is ready to use — &StripedMap{} — for
 // the same reason ConcurrentHMap is: sync.Mutex's zero value is an unlocked mutex, and
 // hMap lazily allocates its first table on the first insert. So an untouched
-// ShardedMap allocates no bucket arrays at all.
+// StripedMap allocates no bucket arrays at all.
 //
-// Always pass *ShardedMap. It contains mutexes and must never be copied (go vet's
+// Always pass *StripedMap. It contains mutexes and must never be copied (go vet's
 // copylocks check will catch it).
-type ShardedMap struct {
+//
+// Striping is not cluster sharding. Every stripe lives in this process and the union
+// of them is the WHOLE keyspace this node holds — stripes divide the lock, not the
+// data. Cluster sharding divides the data across nodes and lives above this type.
+type StripedMap struct {
 	stripes [numStripes]stripe
 
 	// sweepCursor round-robins SweepExpired across stripes, one stripe per call.
 	// atomic because the expiry loop goroutine calls it while connection goroutines
-	// are in the single-key methods; it is the one piece of ShardedMap state that
+	// are in the single-key methods; it is the one piece of StripedMap state that
 	// lives outside any stripe's lock.
 	sweepCursor atomic.Uint64
 }
 
 // stripeFor hashes the key once and returns the stripe that owns it along with the
 // hash, so callers can pass hcode straight down into hMap and never re-derive it.
-func (s *ShardedMap) stripeFor(key string) (*stripe, uint64) {
+func (s *StripedMap) stripeFor(key string) (*stripe, uint64) {
 	hcode := murmur3([]byte(key), storeSeed)
 	return &s.stripes[stripeOf(hcode)], hcode
 }
@@ -116,7 +120,7 @@ func (s *ShardedMap) stripeFor(key string) (*stripe, uint64) {
 // Each locks exactly one stripe. Semantics are identical to ConcurrentHMap's.
 
 // Get returns the value for key. An expired key reports a miss (hMap.search evicts it).
-func (s *ShardedMap) Get(key string) (string, bool) {
+func (s *StripedMap) Get(key string) (string, bool) {
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -130,7 +134,7 @@ func (s *ShardedMap) Get(key string) (string, bool) {
 
 // Set stores key/val. A plain Set clears any existing TTL — matches Redis, where SET
 // without an expiry option makes the key persistent again.
-func (s *ShardedMap) Set(key string, val string) {
+func (s *StripedMap) Set(key string, val string) {
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -140,7 +144,7 @@ func (s *ShardedMap) Set(key string, val string) {
 }
 
 // SetTTL stores key/val with an expiry of ttlSeconds from now. backs `set key val EX n`.
-func (s *ShardedMap) SetTTL(key string, val string, ttlSeconds int64) {
+func (s *StripedMap) SetTTL(key string, val string, ttlSeconds int64) {
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -152,7 +156,7 @@ func (s *ShardedMap) SetTTL(key string, val string, ttlSeconds int64) {
 
 // Expire sets a TTL of ttlSeconds on an existing key.
 // returns true if the key exists (TTL applied), false otherwise. backs `expire`.
-func (s *ShardedMap) Expire(key string, ttlSeconds int64) bool {
+func (s *StripedMap) Expire(key string, ttlSeconds int64) bool {
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -163,7 +167,7 @@ func (s *ShardedMap) Expire(key string, ttlSeconds int64) bool {
 
 // TTL reports the remaining life of a key in whole seconds. backs `ttl`.
 // sentinels match Redis:  -1 = key exists but has no expiry,  -2 = key does not exist.
-func (s *ShardedMap) TTL(key string) int64 {
+func (s *StripedMap) TTL(key string) int64 {
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -185,7 +189,7 @@ func (s *ShardedMap) TTL(key string) int64 {
 
 // Persist removes the TTL from a key, making it immortal again.
 // returns true only if a TTL was actually removed. backs `persist`.
-func (s *ShardedMap) Persist(key string) bool {
+func (s *StripedMap) Persist(key string) bool {
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -200,7 +204,7 @@ func (s *ShardedMap) Persist(key string) bool {
 }
 
 // Del removes a key, reporting whether it was there.
-func (s *ShardedMap) Del(key string) bool {
+func (s *StripedMap) Del(key string) bool {
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -221,7 +225,7 @@ func (s *ShardedMap) Del(key string) bool {
 
 // Size returns the total number of entries across all stripes (and, within a stripe,
 // across both the new and old tables, since during rehashing entries live in both).
-func (s *ShardedMap) Size() int {
+func (s *StripedMap) Size() int {
 	n := 0
 	for i := range s.stripes {
 		st := &s.stripes[i]
@@ -238,7 +242,7 @@ func (s *ShardedMap) Size() int {
 }
 
 // Keys returns a snapshot of every key in the map — per stripe, see the note above.
-func (s *ShardedMap) Keys() []string {
+func (s *StripedMap) Keys() []string {
 	out := make([]string, 0)
 	for i := range s.stripes {
 		st := &s.stripes[i]
@@ -261,7 +265,7 @@ func (s *ShardedMap) Keys() []string {
 // the stripe currently being walked — a deadlock that depends on the hash of whatever
 // key you passed is far worse to debug than one that always fires, so treat the rule as
 // absolute rather than as "usually fine".
-func (s *ShardedMap) ForEach(fn func(key, val string) bool) {
+func (s *StripedMap) ForEach(fn func(key, val string) bool) {
 	for i := range s.stripes {
 		st := &s.stripes[i]
 
@@ -294,7 +298,7 @@ func (s *ShardedMap) ForEach(fn func(key, val string) bool) {
 // Like ConcurrentHMap's version it only sweeps the `new` table. Anything still sitting
 // in `old` during a rehash is either migrated into `new` by helpRehash (where a later
 // sweep catches it) or evicted lazily on access, so nothing leaks permanently.
-func (s *ShardedMap) SweepExpired(now int64, budget int) int {
+func (s *StripedMap) SweepExpired(now int64, budget int) int {
 	// Add returns the NEW value, so subtract one to start this cursor at stripe 0.
 	idx := (s.sweepCursor.Add(1) - 1) & (numStripes - 1)
 	st := &s.stripes[idx]

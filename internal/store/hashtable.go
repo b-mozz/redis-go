@@ -273,7 +273,7 @@ func (m *hMap) triggerRehashing() {
 	m.migratepos = 0
 }
 
-// search is Search with the hash already computed. ShardedMap picks a stripe from
+// search is Search with the hash already computed. StripedMap picks a stripe from
 // hcode before it can call in here, so re-deriving the hash inside would cost a second
 // murmur3 (~11.5ns, BenchmarkMurmur3) on every single operation. The callers that
 // already know hcode pass it down; Search below is the shim for the ones that don't.
@@ -408,7 +408,7 @@ func (m *hMap) setExpiryH(key string, hcode uint64, expireAt int64) bool {
 // setExpiry sets the absolute deadline (Unix nanos) on an existing key.
 // pass expireAt = 0 to clear the TTL (make the key immortal again).
 // returns false if the key doesn't exist. NOT thread-safe on its own — callers
-// go through the ConcurrentHMap / ShardedMap wrappers which hold the lock.
+// go through the ConcurrentHMap / StripedMap wrappers which hold the lock.
 func (m *hMap) setExpiry(key string, expireAt int64) bool {
 	return m.setExpiryH(key, murmur3([]byte(key), m.seed), expireAt)
 }

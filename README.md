@@ -92,7 +92,7 @@ resp/            RESP protocol reader and writer
 - **Hash table** — MurmurHash3, separate chaining.
 - **Progressive rehashing** — on resize, keys migrate a few per operation instead of one
   O(N) pass, so a grow never stalls the server.
-- **Lock striping** — `ShardedMap` fans the keyspace across 32 independent stripes. Each
+- **Lock striping** — `StripedMap` fans the keyspace across 32 independent stripes. Each
   uses a plain `Mutex`, not an `RWMutex`, because progressive rehashing means even a read
   mutates the table.
 - **Expiry** — lazily on access, plus a background sweeper that does a bounded number of

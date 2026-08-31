@@ -415,15 +415,15 @@ func BenchmarkLockedMap_Mixed_Parallel(b *testing.B) {
 }
 
 // ============================================================
-// ShardedMap -- the striped version. see doc/benchmark-before-lock-striping.md
+// StripedMap -- the striped version. see doc/benchmark-before-lock-striping.md
 // ============================================================
 //
 // These are the "after" column. Same workloads as the ConcurrentHMap benchmarks
 // above, so the two are directly comparable at every -cpu setting.
 
-func BenchmarkShardedMap_Set(b *testing.B) {
+func BenchmarkStripedMap_Set(b *testing.B) {
 	keys := makeBenchKeys(benchSize)
-	store := &ShardedMap{}
+	store := &StripedMap{}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -431,9 +431,9 @@ func BenchmarkShardedMap_Set(b *testing.B) {
 	}
 }
 
-func BenchmarkShardedMap_Get(b *testing.B) {
+func BenchmarkStripedMap_Get(b *testing.B) {
 	keys := makeBenchKeys(benchSize)
-	store := &ShardedMap{}
+	store := &StripedMap{}
 
 	for _, key := range keys {
 		store.Set(key, "value")
@@ -445,9 +445,9 @@ func BenchmarkShardedMap_Get(b *testing.B) {
 	}
 }
 
-func BenchmarkShardedMap_Del(b *testing.B) {
+func BenchmarkStripedMap_Del(b *testing.B) {
 	keys := makeBenchKeys(benchSize)
-	store := &ShardedMap{}
+	store := &StripedMap{}
 
 	for _, key := range keys {
 		store.Set(key, "value")
@@ -459,9 +459,9 @@ func BenchmarkShardedMap_Del(b *testing.B) {
 	}
 }
 
-func BenchmarkShardedMap_Get_Parallel(b *testing.B) {
+func BenchmarkStripedMap_Get_Parallel(b *testing.B) {
 	keys := makeBenchKeys(benchSize)
-	store := &ShardedMap{}
+	store := &StripedMap{}
 
 	for _, key := range keys {
 		store.Set(key, "value")
@@ -479,9 +479,9 @@ func BenchmarkShardedMap_Get_Parallel(b *testing.B) {
 	})
 }
 
-func BenchmarkShardedMap_Mixed_Parallel(b *testing.B) {
+func BenchmarkStripedMap_Mixed_Parallel(b *testing.B) {
 	keys := makeBenchKeys(benchSize)
-	store := &ShardedMap{}
+	store := &StripedMap{}
 
 	for _, key := range keys {
 		store.Set(key, "value")
@@ -505,12 +505,12 @@ func BenchmarkShardedMap_Mixed_Parallel(b *testing.B) {
 
 // ---- the cache-line padding, measured rather than assumed ----
 //
-// paddedShardedMap is identical to ShardedMap except each stripe is padded out to a
+// paddedStripedMap is identical to StripedMap except each stripe is padded out to a
 // full 128-byte cache line (M-series line size), so no two stripes' mutexes share one.
 //
-// The real ShardedMap is deliberately NOT padded: measured over n=10 the padding is
+// The real StripedMap is deliberately NOT padded: measured over n=10 the padding is
 // worth geomean -1.22% with the sign flipping across core counts, i.e. nothing. See the
-// comment on `stripe` in sharded.go for why (the mutex shares its line with the same
+// comment on `stripe` in striped.go for why (the mutex shares its line with the same
 // stripe's own hMap header, which the lock holder needs anyway, so the false sharing
 // overlaps with sharing that is real).
 //
@@ -531,11 +531,11 @@ type paddedStripe struct {
 	}{})%benchCacheLine]byte
 }
 
-type paddedShardedMap struct {
+type paddedStripedMap struct {
 	stripes [numStripes]paddedStripe
 }
 
-func (s *paddedShardedMap) Set(key, val string) {
+func (s *paddedStripedMap) Set(key, val string) {
 	hcode := murmur3([]byte(key), storeSeed)
 	st := &s.stripes[stripeOf(hcode)]
 	st.mu.Lock()
@@ -544,7 +544,7 @@ func (s *paddedShardedMap) Set(key, val string) {
 	st.m.setExpiryH(key, hcode, 0)
 }
 
-func (s *paddedShardedMap) Get(key string) (string, bool) {
+func (s *paddedStripedMap) Get(key string) (string, bool) {
 	hcode := murmur3([]byte(key), storeSeed)
 	st := &s.stripes[stripeOf(hcode)]
 	st.mu.Lock()
@@ -556,9 +556,9 @@ func (s *paddedShardedMap) Get(key string) (string, bool) {
 	return node.val, true
 }
 
-func BenchmarkShardedMapPadded_Get_Parallel(b *testing.B) {
+func BenchmarkStripedMapPadded_Get_Parallel(b *testing.B) {
 	keys := makeBenchKeys(benchSize)
-	store := &paddedShardedMap{}
+	store := &paddedStripedMap{}
 
 	for _, key := range keys {
 		store.Set(key, "value")

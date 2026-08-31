@@ -1,10 +1,10 @@
-// sharded_test.go
-// Tests for ShardedMap. Three jobs here:
+// striped_test.go
+// Tests for StripedMap. Three jobs here:
 //
-//  1. prove the striping is CORRECT — that's TestShardedMap_RaceStress under -race,
+//  1. prove the striping is CORRECT — that's TestStripedMap_RaceStress under -race,
 //     which is a direct port of TestConcurrentHMap_RaceStress. Same workload, same
 //     contention, different lock strategy.
-//  2. prove the stripe selection actually spreads keys (TestShardedMap_Distribution).
+//  2. prove the stripe selection actually spreads keys (TestStripedMap_Distribution).
 //     a wrong shift, or using the low bits, still passes every functional test — the
 //     map just quietly degenerates into one busy stripe. only a distribution check
 //     catches that.
@@ -19,10 +19,10 @@ import (
 	"time"
 )
 
-// backdateSharded is the ShardedMap twin of backdate() in ttl_test.go: it pushes a
+// backdateStriped is the StripedMap twin of backdate() in ttl_test.go: it pushes a
 // key's deadline one second into the PAST so it counts as already expired, letting us
 // test expiry instantly instead of sleeping and hoping the clock moves.
-func backdateSharded(s *ShardedMap, key string) {
+func backdateStriped(s *StripedMap, key string) {
 	past := time.Now().UnixNano() - int64(time.Second)
 	st, hcode := s.stripeFor(key)
 	st.mu.Lock()
@@ -31,7 +31,7 @@ func backdateSharded(s *ShardedMap, key string) {
 }
 
 // countPerStripe reports how many live entries each stripe holds.
-func countPerStripe(s *ShardedMap) []int {
+func countPerStripe(s *StripedMap) []int {
 	counts := make([]int, numStripes)
 	for i := range s.stripes {
 		st := &s.stripes[i]
@@ -55,8 +55,8 @@ func countPerStripe(s *ShardedMap) []int {
 //
 // If the per-stripe locking is right this passes clean; if a stripe is ever touched
 // without its own lock held, -race prints the exact conflicting access.
-func TestShardedMap_RaceStress(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_RaceStress(t *testing.T) {
+	s := &StripedMap{}
 
 	const (
 		numGoroutines = 8
@@ -102,8 +102,8 @@ func TestShardedMap_RaceStress(t *testing.T) {
 // a "read" can migrate nodes between tables. Drive several stripes over the
 // maxLoadFactor threshold concurrently and make sure -race stays quiet AND no key is
 // lost in the migration.
-func TestShardedMap_ConcurrentRehash(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_ConcurrentRehash(t *testing.T) {
+	s := &StripedMap{}
 
 	const (
 		numGoroutines = 8
@@ -149,8 +149,8 @@ func TestShardedMap_ConcurrentRehash(t *testing.T) {
 // A wrong shift (or reusing the low bits that hTab already uses for the bucket index)
 // leaves every functional test passing while the map quietly collapses onto one stripe.
 // This is the only test that notices.
-func TestShardedMap_Distribution(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_Distribution(t *testing.T) {
+	s := &StripedMap{}
 
 	const n = 10000
 	for i := 0; i < n; i++ {
@@ -183,8 +183,8 @@ func TestShardedMap_Distribution(t *testing.T) {
 // every key inside a stripe would agree on those bits and pile into a fraction of that
 // stripe's buckets. Check the two index derivations are independent by confirming that,
 // within a single stripe, the bucket indexes are not all identical.
-func TestShardedMap_StripeAndBucketBitsAreDisjoint(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_StripeAndBucketBitsAreDisjoint(t *testing.T) {
+	s := &StripedMap{}
 
 	const n = 10000
 	for i := 0; i < n; i++ {
@@ -228,8 +228,8 @@ func TestShardedMap_StripeAndBucketBitsAreDisjoint(t *testing.T) {
 
 // ==== 3. fan-out ops reach every stripe ====
 
-func TestShardedMap_SizeAndKeysFanOut(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_SizeAndKeysFanOut(t *testing.T) {
+	s := &StripedMap{}
 
 	const n = 5000
 	for i := 0; i < n; i++ {
@@ -268,8 +268,8 @@ func TestShardedMap_SizeAndKeysFanOut(t *testing.T) {
 	}
 }
 
-func TestShardedMap_ForEachStopsEarly(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_ForEachStopsEarly(t *testing.T) {
+	s := &StripedMap{}
 	for i := 0; i < 1000; i++ {
 		s.Set("key:"+strconv.Itoa(i), "value")
 	}
@@ -289,14 +289,14 @@ func TestShardedMap_ForEachStopsEarly(t *testing.T) {
 // visited every stripe -- if the round-robin cursor were broken (or the budget were
 // divided across stripes and floored to zero) some stripes would never be swept and
 // their expired keys would leak until someone happened to read them.
-func TestShardedMap_SweepFansOutAcrossStripes(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_SweepFansOutAcrossStripes(t *testing.T) {
+	s := &StripedMap{}
 
 	const n = 2000
 	for i := 0; i < n; i++ {
 		key := "key:" + strconv.Itoa(i)
 		s.Set(key, "value")
-		backdateSharded(s, key)
+		backdateStriped(s, key)
 	}
 
 	if got := s.Size(); got != n {
@@ -323,14 +323,14 @@ func TestShardedMap_SweepFansOutAcrossStripes(t *testing.T) {
 
 // The sweep must respect its budget: one call visits one stripe and at most `budget`
 // of its buckets, so a single call cannot clear a large keyspace.
-func TestShardedMap_SweepRespectsBudget(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_SweepRespectsBudget(t *testing.T) {
+	s := &StripedMap{}
 
 	const n = 2000
 	for i := 0; i < n; i++ {
 		key := "key:" + strconv.Itoa(i)
 		s.Set(key, "value")
-		backdateSharded(s, key)
+		backdateStriped(s, key)
 	}
 
 	s.SweepExpired(time.Now().UnixNano(), 2)
@@ -344,11 +344,11 @@ func TestShardedMap_SweepRespectsBudget(t *testing.T) {
 // These mirror ttl_test.go. Striping is supposed to be a pure lock refactor, so every
 // one of these behaviours must survive it unchanged.
 
-func TestShardedMap_LazyExpiryEvictsOnAccess(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_LazyExpiryEvictsOnAccess(t *testing.T) {
+	s := &StripedMap{}
 
 	s.Set("session", "abc")
-	backdateSharded(s, "session")
+	backdateStriped(s, "session")
 
 	if _, ok := s.Get("session"); ok {
 		t.Fatal("expected expired key to be a miss on Get, but it was found")
@@ -358,8 +358,8 @@ func TestShardedMap_LazyExpiryEvictsOnAccess(t *testing.T) {
 	}
 }
 
-func TestShardedMap_TTLSentinels(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_TTLSentinels(t *testing.T) {
+	s := &StripedMap{}
 
 	if got := s.TTL("nope"); got != -2 {
 		t.Errorf("TTL of a missing key = %d, want -2", got)
@@ -376,8 +376,8 @@ func TestShardedMap_TTLSentinels(t *testing.T) {
 	}
 }
 
-func TestShardedMap_Persist(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_Persist(t *testing.T) {
+	s := &StripedMap{}
 
 	if s.Persist("nope") {
 		t.Error("Persist on a missing key returned true")
@@ -397,8 +397,8 @@ func TestShardedMap_Persist(t *testing.T) {
 	}
 }
 
-func TestShardedMap_PlainSetClearsTTL(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_PlainSetClearsTTL(t *testing.T) {
+	s := &StripedMap{}
 
 	s.SetTTL("k", "v1", 60)
 	s.Set("k", "v2") // a plain SET must make the key persistent again
@@ -411,8 +411,8 @@ func TestShardedMap_PlainSetClearsTTL(t *testing.T) {
 	}
 }
 
-func TestShardedMap_ExpireAndDel(t *testing.T) {
-	s := &ShardedMap{}
+func TestStripedMap_ExpireAndDel(t *testing.T) {
+	s := &StripedMap{}
 
 	if s.Expire("nope", 10) {
 		t.Error("Expire on a missing key returned true")

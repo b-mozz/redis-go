@@ -23,7 +23,7 @@ const (
 
 // key value store.
 // named db, not store, because `store` is now the package name (github.com/b-mozz/redis-go/internal/store).
-var db = &store.ShardedMap{}
+var db = &store.StripedMap{}
 
 func doRequest(argv []string, w *resp.Writer) {
 	if len(argv) == 0 {
